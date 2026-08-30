@@ -5356,6 +5356,16 @@ forbidden-tokens = []
     }
 
     #[test]
+    fn arch_r0_06_multiline_code_spans_are_not_links() {
+        let source = concat!(
+            "A layout is `[chunk len u32][chunk crc32c u32][chunk\n",
+            "bytes]` followed by a footer.\n",
+        );
+        let violations = validate_relative_links(source, &[]);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
     fn arch_r0_06_gate_sequence_rejects_accepted_after_unaccepted() {
         let invalid_sequence = valid_gate_registry()
             .replacen("status = \"accepted\"", "status = \"in progress\"", 1)

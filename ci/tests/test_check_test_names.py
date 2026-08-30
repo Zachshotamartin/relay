@@ -53,6 +53,106 @@ fn not_a_real_test() {}
 
             self.assertEqual([], check_test_names.find_violations(Path(directory)))
 
+    def test_r0_name_04_ignores_attributes_inside_literals_and_nested_comments(self) -> None:
+        source = r'''
+const NORMAL: &str = "#[test] fn not_a_string_test() {}";
+const RAW: &str = r##"#[tokio::test] async fn not_a_raw_test() {}"##;
+const BYTE: &[u8] = br#"#[test] fn not_a_byte_string_test() {}"#;
+/* outer
+   /* #[test] fn not_a_nested_comment_test() {} */
+*/
+// #[test] fn not_a_line_comment_test() {}
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tests" / "literals.rs"
+            path.parent.mkdir()
+            path.write_text(source, encoding="utf-8")
+
+            self.assertEqual([], check_test_names.find_violations(Path(directory)))
+
+    def test_r0_name_05_recognizes_multiline_qualified_test_attribute(self) -> None:
+        source = """#[
+    tokio :: test
+]
+#[ignore]
+pub async fn missing_family_prefix() {}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tests" / "qualified.rs"
+            path.parent.mkdir()
+            path.write_text(source, encoding="utf-8")
+
+            violations = check_test_names.find_violations(Path(directory))
+
+        self.assertEqual(1, len(violations))
+        self.assertEqual("missing_family_prefix", violations[0].name)
+        self.assertEqual(5, violations[0].line)
+
+    def test_r0_name_06_uses_exact_spine_family_prefixes(self) -> None:
+        families = (
+            "core",
+            "stor",
+            "crsh",
+            "sim",
+            "modl",
+            "fifo",
+            "topc",
+            "wire",
+            "fuzz",
+            "raft",
+            "admn",
+            "opsx",
+            "migr",
+            "soak",
+            "bench",
+            "mut",
+            "mkt",
+        )
+        accepted = "\n".join(
+            f"#[test]\nfn {family}_named_evidence() {{}}" for family in families
+        )
+        source = f"{accepted}\n#[test]\nfn corex_not_the_core_family() {{}}\n"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tests" / "families.rs"
+            path.parent.mkdir()
+            path.write_text(source, encoding="utf-8")
+
+            violations = check_test_names.find_violations(Path(directory))
+
+        self.assertEqual(["corex_not_the_core_family"], [item.name for item in violations])
+
+    def test_r0_name_07_reports_in_deterministic_path_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            later = root / "z" / "tests" / "z.rs"
+            earlier = root / "a" / "tests" / "a.rs"
+            later.parent.mkdir(parents=True)
+            earlier.parent.mkdir(parents=True)
+            later.write_text("#[test]\nfn later() {}\n", encoding="utf-8")
+            earlier.write_text("#[test]\nfn earlier() {}\n", encoding="utf-8")
+
+            violations = check_test_names.find_violations(root)
+
+        self.assertEqual(["earlier", "later"], [item.name for item in violations])
+
+    def test_r0_name_08_fails_closed_on_non_utf8_rust_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tests" / "invalid.rs"
+            path.parent.mkdir()
+            path.write_bytes(b"#[test]\nfn hidden() {}\n\xff")
+
+            with self.assertRaisesRegex(check_test_names.ScanError, "UTF-8"):
+                check_test_names.find_violations(Path(directory))
+
+    def test_r0_name_09_ignores_rust_files_outside_tests_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "src" / "tests_support.rs"
+            path.parent.mkdir()
+            path.write_text("#[test]\nfn internal_unit_test() {}\n", encoding="utf-8")
+
+            self.assertEqual([], check_test_names.find_violations(root))
+
 
 if __name__ == "__main__":
     unittest.main()

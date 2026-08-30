@@ -591,6 +591,25 @@ pub fn validate_relative_links(_source: &str, _known_paths: &[String]) -> Vec<Vi
 }
 
 #[must_use]
+pub fn validate_status_discipline(_source: &str) -> Vec<Violation> {
+    Vec::new()
+}
+
+/// Runs only the R0.06 gate-registry and documentation checks against fixture
+/// inputs.
+///
+/// # Errors
+///
+/// Returns deterministic, file-qualified diagnostics for every malformed or
+/// unreadable required input, unearned claim, and dangling relative link.
+pub fn check_r0_06_fixture_files(
+    _gate_registry: &Path,
+    _docs_root: &Path,
+) -> Result<(), Vec<Violation>> {
+    Ok(())
+}
+
+#[must_use]
 pub fn validate_test_names(_source: &str) -> Vec<Violation> {
     Vec::new()
 }
@@ -2359,6 +2378,152 @@ forbidden-tokens = []
         );
         assert_eq!(violations.len(), 1);
         assert!(violations[0].message.contains("missing.md"));
+    }
+
+    fn valid_gate_registry() -> String {
+        let mut source = "schema = 1\n".to_owned();
+        for number in 0..=10 {
+            let status = if number == 0 { "accepted" } else { "planned" };
+            let commands = if number == 0 {
+                "[\"cargo test --workspace --locked\"]"
+            } else {
+                "[]"
+            };
+            source.push_str(&format!(
+                "\n[gate.R{number}]\nstatus = \"{status}\"\nsection = \"BUILD_PLAN.md §{}\"\ncommands = {commands}\n",
+                number + 5
+            ));
+        }
+        source
+    }
+
+    #[test]
+    fn arch_r0_06_gate_schema_is_total_and_requires_complete_evidence() {
+        assert!(validate_gates(&valid_gate_registry()).is_empty());
+
+        let missing = valid_gate_registry().replace(
+            "\n[gate.R10]\nstatus = \"planned\"\nsection = \"BUILD_PLAN.md §15\"\ncommands = []\n",
+            "",
+        );
+        let missing_violations = validate_gates(&missing);
+        assert!(
+            missing_violations
+                .iter()
+                .any(|item| item.message.contains("R10")),
+            "{missing_violations:?}"
+        );
+
+        let duplicate = format!(
+            "{}\n[gate.R0]\nstatus = \"planned\"\n",
+            valid_gate_registry()
+        );
+        let duplicate_violations = validate_gates(&duplicate);
+        assert!(
+            duplicate_violations.iter().any(|item| item.line > 1
+                && item.message.contains("duplicate")
+                && item.message.contains("R0")),
+            "{duplicate_violations:?}"
+        );
+
+        let unknown_status =
+            valid_gate_registry().replacen("status = \"planned\"", "status = \"complete\"", 1);
+        let status_violations = validate_gates(&unknown_status);
+        assert!(
+            status_violations
+                .iter()
+                .any(|item| item.message.contains("status") && item.message.contains("complete")),
+            "{status_violations:?}"
+        );
+
+        let empty_accepted = valid_gate_registry().replacen(
+            "commands = [\"cargo test --workspace --locked\"]",
+            "commands = []",
+            1,
+        );
+        let command_violations = validate_gates(&empty_accepted);
+        assert!(
+            command_violations
+                .iter()
+                .any(|item| item.message.contains("accepted gate R0 must have commands")),
+            "{command_violations:?}"
+        );
+
+        let malformed = valid_gate_registry().replacen("schema = 1", "schema = [", 1);
+        assert!(
+            !validate_gates(&malformed).is_empty(),
+            "malformed registry input was silently accepted"
+        );
+    }
+
+    #[test]
+    fn arch_r0_06_status_scan_rejects_unearned_claim_with_line() {
+        let unearned = "**Status:** planned.\nRelay provides durable delivery.\n";
+        let violations = validate_status_discipline(unearned);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].line, 2);
+        assert!(violations[0].message.contains("provides"));
+        assert!(violations[0].message.contains("planned"));
+
+        let qualified =
+            "**Status:** planned.\nRelay provides durable delivery only as planned for R2.\n";
+        assert!(validate_status_discipline(qualified).is_empty());
+        let accepted = "**Status:** accepted.\nRelay provides durable delivery.\n";
+        assert!(validate_status_discipline(accepted).is_empty());
+    }
+
+    #[test]
+    fn arch_r0_06_links_ignore_external_and_anchor_but_report_relative_line() {
+        let source = concat!(
+            "[external](https://example.com) [anchor](#local)\n",
+            "[ok](./guide.md#section) [bad](nested/missing.md)\n",
+        );
+        let violations = validate_relative_links(source, &["guide.md".to_owned()]);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].line, 2);
+        assert!(violations[0].message.contains("nested/missing.md"));
+    }
+
+    #[test]
+    fn arch_r0_06_file_pass_fails_closed_with_qualified_diagnostics() {
+        let temp_root =
+            std::env::temp_dir().join(format!("relay-arch-r0-06-{}", std::process::id()));
+        let docs_root = temp_root.join("docs");
+        fs::create_dir_all(&docs_root).expect("temporary docs tree must be created");
+        let gates_path = temp_root.join("gates.toml");
+        fs::write(&gates_path, valid_gate_registry()).expect("gate fixture must be written");
+        fs::write(
+            docs_root.join("README.md"),
+            "**Status:** planned.\nRelay guarantees persistence.\n[missing](./missing.md)\n",
+        )
+        .expect("docs fixture must be written");
+
+        let violations = check_r0_06_fixture_files(&gates_path, &docs_root)
+            .expect_err("unearned claim and broken link must fail");
+        fs::remove_dir_all(&temp_root).expect("temporary fixture must be removed");
+        assert!(
+            violations
+                .iter()
+                .any(|item| item.message.contains("README.md line 2")
+                    && item.message.contains("guarantees")),
+            "{violations:?}"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|item| item.message.contains("README.md line 3")
+                    && item.message.contains("missing.md")),
+            "{violations:?}"
+        );
+
+        let unreadable = fixture_path("unreadable-directory");
+        let unreadable_violations = check_r0_06_fixture_files(&unreadable, &docs_root)
+            .expect_err("unreadable gate registry must fail closed");
+        assert!(
+            unreadable_violations
+                .iter()
+                .any(|item| item.message.contains("cannot read")),
+            "{unreadable_violations:?}"
+        );
     }
 
     #[test]

@@ -41,10 +41,10 @@ _FUNCTION = re.compile(
     rf"(?:(?:const|async|unsafe|extern)\s+)*"
     rf"fn\s+(?P<name>{_IDENTIFIER})"
 )
-_DYNAMIC_FUNCTION = re.compile(
+_FUNCTION_DECLARATION = re.compile(
     r"(?:pub\s*(?:\([^)]*\))?\s+)?"
     r"(?:(?:const|async|unsafe|extern)\s+)*"
-    r"fn\s+\$\s*(?:r#)?[A-Za-z_][A-Za-z0-9_]*"
+    r"fn\b"
 )
 _TEST_ATTRIBUTE_NAMES = {"test", "rstest", "proptest", "test_case"}
 
@@ -248,7 +248,7 @@ def _test_functions(source: str) -> Iterator[tuple[str, int]]:
         function_start = _skip_attributes(masked, closing + 1)
         function = _FUNCTION.match(masked, function_start)
         if function is None:
-            if _DYNAMIC_FUNCTION.match(masked, function_start) is not None:
+            if _FUNCTION_DECLARATION.match(masked, function_start) is not None:
                 line = source.count("\n", 0, attribute.start()) + 1
                 key = ("<dynamic-test-name>", line)
                 if key not in seen:

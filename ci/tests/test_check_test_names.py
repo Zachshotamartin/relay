@@ -198,6 +198,25 @@ macro_rules! make_test {
         self.assertEqual(["<dynamic-test-name>"], [item.name for item in violations])
         self.assertEqual([3], [item.line for item in violations])
 
+    def test_r0_name_12_rejects_macro_indirected_test_attributes(self) -> None:
+        source = """macro_rules! mark {
+    ($attr:meta) => {
+        #[$attr]
+        fn bad_name() {}
+    };
+}
+mark!(test);
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tests" / "generated_attribute.rs"
+            path.parent.mkdir()
+            path.write_text(source, encoding="utf-8")
+
+            violations = check_test_names.find_violations(Path(directory))
+
+        self.assertEqual(["bad_name"], [item.name for item in violations])
+        self.assertEqual([4], [item.line for item in violations])
+
 
 if __name__ == "__main__":
     unittest.main()

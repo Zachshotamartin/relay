@@ -4579,6 +4579,32 @@ forbidden-tokens = []
     }
 
     #[test]
+    fn arch_r0_06_status_scope_and_claim_words_fail_closed() {
+        let planned = concat!(
+            "## R1\n",
+            "**Status:** planned.\n",
+            "### Details\n",
+            "Relay currently supports durable delivery.\n",
+            "The service provides long polling.\n",
+        );
+        let violations = validate_status_discipline(planned);
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        assert_eq!(
+            violations.iter().map(|item| item.line).collect::<Vec<_>>(),
+            [4, 5]
+        );
+
+        let unmatched = "**Status:** planned.\n`unmatched Relay guarantees persistence.\n";
+        let unmatched_violations = validate_status_discipline(unmatched);
+        assert_eq!(unmatched_violations.len(), 1, "{unmatched_violations:?}");
+        assert_eq!(unmatched_violations[0].line, 2);
+
+        let uppercase = validate_status_discipline("**Status:** PLANNED.\n");
+        assert_eq!(uppercase.len(), 1, "{uppercase:?}");
+        assert_eq!(uppercase[0].line, 1);
+    }
+
+    #[test]
     fn arch_r0_06_links_ignore_external_and_anchor_but_report_relative_line() {
         let source = concat!(
             "[external](https://example.com) [anchor](#local)\n",
@@ -4588,6 +4614,108 @@ forbidden-tokens = []
         assert_eq!(violations.len(), 1, "{violations:?}");
         assert_eq!(violations[0].line, 2);
         assert!(violations[0].message.contains("nested/missing.md"));
+    }
+
+    #[test]
+    fn arch_r0_06_reference_links_and_malformed_inline_code_fail_closed() {
+        let source = concat!(
+            "> [guide][g]\n",
+            ">\n",
+            "> [g]: ./missing.md\n",
+            "prose](./not-a-link.md)\n",
+            "[^1]: explanatory prose\n",
+            "`unmatched [also-missing](./also-missing.md)\n",
+        );
+        let violations = validate_relative_links(source, &[]);
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        assert!(
+            violations
+                .iter()
+                .any(|item| item.line == 3 && item.message.contains("missing.md")),
+            "{violations:?}"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|item| item.line == 6 && item.message.contains("also-missing.md")),
+            "{violations:?}"
+        );
+        assert!(
+            violations
+                .iter()
+                .all(|item| !item.message.contains("not-a-link")
+                    && !item.message.contains("explanatory")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn arch_r0_06_gate_sequence_rejects_accepted_after_unaccepted() {
+        let invalid_sequence = valid_gate_registry()
+            .replacen("status = \"accepted\"", "status = \"in progress\"", 1)
+            .replacen("status = \"planned\"", "status = \"accepted\"", 1);
+        let sequence_violations = validate_gates(&invalid_sequence);
+        assert!(
+            sequence_violations.iter().any(|item| item.line == 9
+                && item.message.contains("R1")
+                && item.message.contains("R0")),
+            "{sequence_violations:?}"
+        );
+    }
+
+    #[test]
+    fn arch_r0_06_gate_sections_must_be_in_replay_order() {
+        let out_of_order = valid_gate_registry()
+            .replacen("[gate.R1]", "[gate.TEMP]", 1)
+            .replacen("[gate.R2]", "[gate.R1]", 1)
+            .replacen("[gate.TEMP]", "[gate.R2]", 1);
+        let order_violations = validate_gates(&out_of_order);
+        assert!(
+            order_violations
+                .iter()
+                .any(|item| item.message.contains("order")),
+            "{order_violations:?}"
+        );
+    }
+
+    #[test]
+    fn arch_r0_06_gate_strings_reject_raw_newlines() {
+        let multiline = valid_gate_registry().replacen(
+            "commands = [\"cargo test --workspace --locked\"]",
+            "commands = [\"cargo\n test --workspace --locked\"]",
+            1,
+        );
+        let multiline_violations = validate_gates(&multiline);
+        assert!(
+            multiline_violations
+                .iter()
+                .any(|item| item.line == 6 && item.message.contains("commands")),
+            "{multiline_violations:?}"
+        );
+    }
+
+    #[test]
+    fn arch_r0_06_gate_semantic_errors_report_field_lines() {
+        let wrong_fields = valid_gate_registry()
+            .replacen("section = \"BUILD_PLAN.md §5\"", "section = \"wrong\"", 1)
+            .replacen(
+                "commands = [\"cargo test --workspace --locked\"]",
+                "commands = []",
+                1,
+            );
+        let field_violations = validate_gates(&wrong_fields);
+        assert!(
+            field_violations
+                .iter()
+                .any(|item| item.line == 5 && item.message.contains("section")),
+            "{field_violations:?}"
+        );
+        assert!(
+            field_violations
+                .iter()
+                .any(|item| item.line == 6 && item.message.contains("commands")),
+            "{field_violations:?}"
+        );
     }
 
     #[test]
@@ -4606,7 +4734,6 @@ forbidden-tokens = []
 
         let violations = check_r0_06_fixture_files(&gates_path, &docs_root)
             .expect_err("unearned claim and broken link must fail");
-        fs::remove_dir_all(&temp_root).expect("temporary fixture must be removed");
         assert!(
             violations
                 .iter()
@@ -4624,12 +4751,57 @@ forbidden-tokens = []
 
         let unreadable = fixture_path("unreadable-directory");
         let unreadable_violations = check_r0_06_fixture_files(&unreadable, &docs_root)
-            .expect_err("unreadable gate registry must fail closed");
+            .expect_err("all independent fixture violations must be aggregated");
+        fs::remove_dir_all(&temp_root).expect("temporary fixture must be removed");
         assert!(
             unreadable_violations
                 .iter()
                 .any(|item| item.message.contains("cannot read")),
             "{unreadable_violations:?}"
+        );
+        assert!(
+            unreadable_violations
+                .iter()
+                .any(|item| item.message.contains("README.md line 2")
+                    && item.message.contains("guarantees")),
+            "{unreadable_violations:?}"
+        );
+        assert!(
+            unreadable_violations
+                .iter()
+                .any(|item| item.message.contains("README.md line 3")
+                    && item.message.contains("missing.md")),
+            "{unreadable_violations:?}"
+        );
+    }
+
+    #[test]
+    fn arch_r0_06_workspace_aggregates_independent_input_failures() {
+        let temp_root =
+            std::env::temp_dir().join(format!("relay-arch-r0-06-workspace-{}", std::process::id()));
+        let docs_root = temp_root.join("docs");
+        fs::create_dir_all(&docs_root).expect("temporary docs tree must be created");
+        fs::write(
+            docs_root.join("README.md"),
+            "**Status:** planned.\nRelay supports persistence.\n",
+        )
+        .expect("docs fixture must be written");
+
+        let violations = check_workspace_r0_04(&temp_root)
+            .expect_err("independent required-input failures must aggregate");
+        fs::remove_dir_all(&temp_root).expect("temporary fixture must be removed");
+        assert!(
+            violations
+                .iter()
+                .any(|item| item.message.contains("arch.toml")),
+            "{violations:?}"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|item| item.message.contains("README.md line 2")
+                    && item.message.contains("supports")),
+            "{violations:?}"
         );
     }
 

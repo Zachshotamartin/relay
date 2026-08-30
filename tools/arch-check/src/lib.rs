@@ -544,6 +544,22 @@ pub fn scan_source(source: &str, tokens: &[String]) -> Vec<Violation> {
     let source_tokens = rust_tokens(&cleaned, &syntax);
     let use_paths = expanded_use_paths(&source_tokens);
     let mut violations = Vec::new();
+    for window in source_tokens.windows(3) {
+        if window[0].text == "#" && window[1].text == "[" && window[2].text == "path" {
+            violations.push(Violation::new(
+                window[0].line,
+                "#[path] source indirection is forbidden; architecture checks require conventional module paths",
+            ));
+        }
+    }
+    if tokens_forbid_std_paths(tokens) {
+        violations.extend(std_aliases(&source_tokens).into_iter().map(|token| {
+            Violation::new(
+                token.line,
+                "aliasing std is forbidden when protected std paths are denied",
+            )
+        }));
+    }
     for forbidden in tokens {
         if forbidden.is_empty() {
             continue;
@@ -574,6 +590,70 @@ pub fn scan_source(source: &str, tokens: &[String]) -> Vec<Violation> {
         );
     }
     violations
+}
+
+fn tokens_forbid_std_paths(tokens: &[String]) -> bool {
+    tokens.iter().any(|token| token.starts_with("std::"))
+}
+
+fn std_aliases(tokens: &[RustToken]) -> Vec<&RustToken> {
+    let mut aliases = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if token.text == "use" {
+            let mut cursor = index + 1;
+            if tokens.get(cursor).is_some_and(|item| item.text == "::") {
+                cursor += 1;
+            }
+            if tokens.get(cursor).is_some_and(|item| item.text == "std")
+                && tokens.get(cursor + 1).is_some_and(|item| item.text == "as")
+                && tokens
+                    .get(cursor + 2)
+                    .is_some_and(|item| is_rust_identifier(&item.text))
+            {
+                aliases.push(&tokens[cursor]);
+            } else if tokens.get(cursor).is_some_and(|item| item.text == "std")
+                && tokens.get(cursor + 1).is_some_and(|item| item.text == "::")
+                && tokens.get(cursor + 2).is_some_and(|item| item.text == "{")
+            {
+                let mut group_cursor = cursor + 3;
+                let mut depth = 1_u32;
+                while let Some(item) = tokens.get(group_cursor) {
+                    if item.text == "{" {
+                        depth += 1;
+                    } else if item.text == "}" {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else if depth == 1
+                        && item.text == "self"
+                        && tokens
+                            .get(group_cursor + 1)
+                            .is_some_and(|next| next.text == "as")
+                        && tokens
+                            .get(group_cursor + 2)
+                            .is_some_and(|alias| is_rust_identifier(&alias.text))
+                    {
+                        aliases.push(&tokens[cursor]);
+                        break;
+                    }
+                    group_cursor += 1;
+                }
+            }
+        } else if token.text == "extern"
+            && tokens
+                .get(index + 1)
+                .is_some_and(|item| item.text == "crate")
+            && tokens.get(index + 2).is_some_and(|item| item.text == "std")
+            && tokens.get(index + 3).is_some_and(|item| item.text == "as")
+            && tokens
+                .get(index + 4)
+                .is_some_and(|item| is_rust_identifier(&item.text))
+        {
+            aliases.push(&tokens[index + 2]);
+        }
+    }
+    aliases
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -801,8 +881,8 @@ pub fn validate_source_layout(manifest: &str) -> Vec<Violation> {
                 line_number,
                 "custom target path is forbidden; architecture checks require Cargo's conventional src layout",
             ));
-        } else if section == "package"
-            && key_components.as_slice() == ["build"]
+        } else if ((section == "package" && key_components.as_slice() == ["build"])
+            || (section.is_empty() && key_components.as_slice() == ["package", "build"]))
             && parse_toml_string(value.trim()).is_ok()
         {
             violations.push(Violation::new(
@@ -3966,6 +4046,15 @@ pub fn production() {
         let alias_violations = scan_source(aliased, &["std::time".to_owned()]);
         assert_eq!(alias_violations.len(), 1, "{alias_violations:?}");
         assert_eq!(alias_violations[0].line, 1);
+
+        let grouped_alias = concat!(
+            "use std::{self as platform};\n",
+            "use platform::time::SystemTime as Clock;\n",
+            "fn production() { let _ = Clock::now(); }\n",
+        );
+        let grouped_violations = scan_source(grouped_alias, &["std::time".to_owned()]);
+        assert_eq!(grouped_violations.len(), 1, "{grouped_violations:?}");
+        assert_eq!(grouped_violations[0].line, 1);
 
         let indirect = "#[path = \"generated/production.rs\"]\nmod production;\nfn harmless() {}\n";
         let path_violations = scan_source(indirect, &["std::time".to_owned()]);

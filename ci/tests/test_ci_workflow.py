@@ -58,8 +58,20 @@ class WorkflowGraphTests(unittest.TestCase):
             if action_ref.startswith("./"):
                 continue
             self.assertRegex(action_ref, r"^[^@\s]+@[0-9a-f]{40}$")
+        self.assertIn("toolchain: 1.85.0", workflow)
+        self.assertIn("just-version: 1.36.0", workflow)
         self.assertNotIn("${{ secrets.", workflow)
         self.assertNotRegex(workflow, r"(?i)(?:^|/)cache(?:@|/)")
+
+        deny = mapping_block(mapping_block(workflow, "jobs", indent=0), "deny", indent=2)
+        self.assertIn(
+            "cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz",
+            deny,
+        )
+        self.assertIn(
+            "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f",
+            deny,
+        )
 
     def test_r0_ci_03_has_required_linux_and_advisory_macos_matrix(self) -> None:
         workflow = source(WORKFLOW)

@@ -11,8 +11,9 @@ targets = [
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-# cargo-deny 0.16.4 removed the `unmaintained` key. Maintenance status remains
-# mandatory in the per-dependency review checklist.
+# The compatible cargo-deny 0.20.2 schema does not accept the documented
+# `unmaintained = "workspace"` key. Maintenance status remains mandatory in
+# the per-dependency review checklist.
 # Every ignore requires an issue link and expiry date.
 ignore = []
 

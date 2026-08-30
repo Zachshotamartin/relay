@@ -16,7 +16,7 @@ forbidden-tokens = ["std::fs", "SystemTime::now", "Instant::now", "tokio::"]
 allowed-deps = ["relay-core", "relay-wal"]
 allowed-dev-deps = ["proptest"]
 forbidden-deps = ["rand", "relay-server", "relay-wire", "tokio"]
-forbidden-tokens = ["std::time", "rand::", "tokio::"]
+forbidden-tokens = ["std::time", "SystemTime::now", "Instant::now", "thread::sleep", "std::fs", "std::net", "rand::", "tokio::"]
 
 [crate.relay-sim]
 allowed-deps = ["relay-client", "relay-core", "relay-model", "relay-server"]

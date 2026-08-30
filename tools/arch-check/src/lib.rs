@@ -509,10 +509,16 @@ pub fn check_workspace_r0_04(root: &Path) -> Result<(), Vec<Violation>> {
     manifests.dedup();
     for manifest_path in manifests {
         match fs::read_to_string(&manifest_path) {
-            Ok(manifest) => violations.extend(qualify_violations(
-                &manifest_path,
-                check_exact_requirements(&manifest),
-            )),
+            Ok(manifest) => {
+                violations.extend(qualify_violations(
+                    &manifest_path,
+                    check_exact_requirements(&manifest),
+                ));
+                violations.extend(qualify_violations(
+                    &manifest_path,
+                    validate_source_layout(&manifest),
+                ));
+            }
             Err(error) => violations.push(Violation::new(
                 1,
                 format!(
@@ -535,24 +541,288 @@ pub fn check_workspace_r0_04(root: &Path) -> Result<(), Vec<Violation>> {
 pub fn scan_source(source: &str, tokens: &[String]) -> Vec<Violation> {
     let (mut cleaned, syntax) = lex_rust(source);
     mask_cfg_test_items(&mut cleaned, &syntax);
-    let cleaned = String::from_utf8(cleaned).unwrap_or_else(|_| source.to_owned());
+    let source_tokens = rust_tokens(&cleaned, &syntax);
+    let use_paths = expanded_use_paths(&source_tokens);
     let mut violations = Vec::new();
-    for (line_index, line) in cleaned.lines().enumerate() {
-        for token in tokens {
-            if !token.is_empty() && line.contains(token) {
-                violations.push(Violation::new(
-                    line_index + 1,
-                    format!("forbidden source token {token:?}"),
-                ));
+    for forbidden in tokens {
+        if forbidden.is_empty() {
+            continue;
+        }
+        let (pattern_source, pattern_syntax) = lex_rust(forbidden);
+        let pattern = rust_tokens(&pattern_source, &pattern_syntax);
+        if pattern.is_empty() {
+            continue;
+        }
+        let mut hits = BTreeMap::new();
+        if pattern.len() <= source_tokens.len() {
+            for window in source_tokens.windows(pattern.len()) {
+                if rust_token_texts_equal(window, &pattern) {
+                    hits.insert(window[0].offset, window[0].line);
+                }
             }
+        }
+        if let Some(path_pattern) = rust_path_pattern(&pattern) {
+            for path in &use_paths {
+                for hit in matching_use_path_offsets(path, &path_pattern) {
+                    hits.insert(hit.offset, hit.line);
+                }
+            }
+        }
+        violations.extend(
+            hits.into_values()
+                .map(|line| Violation::new(line, format!("forbidden source token {forbidden:?}"))),
+        );
+    }
+    violations
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RustToken {
+    text: String,
+    line: usize,
+    offset: usize,
+}
+
+#[derive(Clone, Debug)]
+struct RustPathPattern {
+    segments: Vec<String>,
+    requires_descendant: bool,
+}
+
+fn rust_tokens(source: &[u8], syntax: &[bool]) -> Vec<RustToken> {
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    let mut line = 1;
+    while index < source.len() {
+        if source[index] == b'\n' {
+            line += 1;
+            index += 1;
+            continue;
+        }
+        if !syntax[index] || source[index].is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        if is_rust_identifier_byte(source[index]) {
+            index += 1;
+            while index < source.len() && syntax[index] && is_rust_identifier_byte(source[index]) {
+                index += 1;
+            }
+        } else if source.get(index..index + 2) == Some(b"::")
+            && syntax.get(index + 1) == Some(&true)
+        {
+            index += 2;
+        } else {
+            index += 1;
+        }
+        tokens.push(RustToken {
+            text: String::from_utf8_lossy(&source[start..index]).into_owned(),
+            line,
+            offset: start,
+        });
+    }
+    tokens
+}
+
+fn is_rust_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || !byte.is_ascii()
+}
+
+fn rust_token_texts_equal(left: &[RustToken], right: &[RustToken]) -> bool {
+    left.iter()
+        .zip(right)
+        .all(|(left, right)| left.text == right.text)
+}
+
+fn rust_path_pattern(tokens: &[RustToken]) -> Option<RustPathPattern> {
+    let mut segments = Vec::new();
+    let mut expect_segment = true;
+    for token in tokens {
+        if expect_segment {
+            if !is_rust_identifier(&token.text) {
+                return None;
+            }
+            segments.push(token.text.clone());
+        } else if token.text != "::" {
+            return None;
+        }
+        expect_segment = !expect_segment;
+    }
+    if segments.is_empty() {
+        None
+    } else {
+        Some(RustPathPattern {
+            segments,
+            requires_descendant: expect_segment,
+        })
+    }
+}
+
+fn is_rust_identifier(value: &str) -> bool {
+    value
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| is_rust_identifier_byte(*byte))
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| is_rust_identifier_byte(*byte))
+}
+
+fn matching_use_path_offsets<'a>(
+    path: &'a [RustToken],
+    pattern: &RustPathPattern,
+) -> Vec<&'a RustToken> {
+    let mut hits = Vec::new();
+    if pattern.segments.len() > path.len() {
+        return hits;
+    }
+    for start in 0..=path.len() - pattern.segments.len() {
+        let end = start + pattern.segments.len();
+        if pattern.requires_descendant && end == path.len() {
+            continue;
+        }
+        if path[start..end]
+            .iter()
+            .zip(&pattern.segments)
+            .all(|(token, segment)| token.text == *segment)
+        {
+            hits.push(&path[start]);
+        }
+    }
+    hits
+}
+
+fn expanded_use_paths(tokens: &[RustToken]) -> Vec<Vec<RustToken>> {
+    let mut paths = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        if tokens[index].text != "use" {
+            index += 1;
+            continue;
+        }
+        index += 1;
+        parse_use_tree(tokens, &mut index, &[], &mut paths);
+        while index < tokens.len() && tokens[index].text != ";" {
+            index += 1;
+        }
+        index = (index + 1).min(tokens.len());
+    }
+    paths
+}
+
+fn parse_use_tree(
+    tokens: &[RustToken],
+    index: &mut usize,
+    prefix: &[RustToken],
+    paths: &mut Vec<Vec<RustToken>>,
+) {
+    if tokens.get(*index).is_some_and(|token| token.text == "{") {
+        *index += 1;
+        while *index < tokens.len() && tokens[*index].text != "}" {
+            let before = *index;
+            parse_use_tree(tokens, index, prefix, paths);
+            if tokens.get(*index).is_some_and(|token| token.text == ",") || *index == before {
+                *index += 1;
+            }
+        }
+        if tokens.get(*index).is_some_and(|token| token.text == "}") {
+            *index += 1;
+        }
+        return;
+    }
+
+    if tokens.get(*index).is_some_and(|token| token.text == "::") {
+        *index += 1;
+    }
+    let mut path = prefix.to_vec();
+    while let Some(token) = tokens.get(*index) {
+        if token.text == "*" {
+            *index += 1;
+            break;
+        }
+        if !is_rust_identifier(&token.text) || token.text == "as" {
+            break;
+        }
+        path.push(token.clone());
+        *index += 1;
+        if tokens.get(*index).is_none_or(|token| token.text != "::") {
+            break;
+        }
+        *index += 1;
+        if tokens.get(*index).is_some_and(|token| token.text == "{") {
+            parse_use_tree(tokens, index, &path, paths);
+            return;
+        }
+    }
+    if tokens.get(*index).is_some_and(|token| token.text == "as") {
+        *index += 1;
+        if tokens
+            .get(*index)
+            .is_some_and(|token| is_rust_identifier(&token.text))
+        {
+            *index += 1;
+        }
+    }
+    if !path.is_empty() {
+        paths.push(path);
+    }
+}
+
+#[must_use]
+pub fn validate_source_layout(manifest: &str) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    let mut section = String::new();
+    for (line_index, raw_line) in manifest.lines().enumerate() {
+        let line_number = line_index + 1;
+        let line = strip_toml_comment(raw_line).trim();
+        if let Some(table) = cargo_table_header(line) {
+            section = table;
+            continue;
+        }
+        let Some((key, value)) = split_assignment(line) else {
+            continue;
+        };
+        let key_components = toml_dotted_key_components(key.trim());
+        let target_section = matches!(
+            section.as_str(),
+            "lib" | "bin" | "example" | "test" | "bench"
+        );
+        let dotted_target_path = section.is_empty()
+            && matches!(
+                key_components.as_slice(),
+                [target, field]
+                    if matches!(target.as_str(), "lib" | "bin" | "example" | "test" | "bench")
+                        && field == "path"
+            );
+        if (target_section && key_components.as_slice() == ["path"]) || dotted_target_path {
+            violations.push(Violation::new(
+                line_number,
+                "custom target path is forbidden; architecture checks require Cargo's conventional src layout",
+            ));
+        } else if section == "package"
+            && key_components.as_slice() == ["build"]
+            && parse_toml_string(value.trim()).is_ok()
+        {
+            violations.push(Violation::new(
+                line_number,
+                "custom target path for package build script is forbidden",
+            ));
         }
     }
     violations
 }
 
-#[must_use]
-pub fn validate_source_layout(_manifest: &str) -> Vec<Violation> {
-    Vec::new()
+fn cargo_table_header(line: &str) -> Option<String> {
+    if let Some(inner) = line
+        .strip_prefix("[[")
+        .and_then(|value| value.strip_suffix("]]"))
+    {
+        let inner = inner.trim();
+        return (!inner.is_empty()).then(|| inner.to_owned());
+    }
+    parse_table_header(line)
 }
 
 /// Runs only the R0.05 source checks against a deterministic fixture tree.
@@ -1911,40 +2181,326 @@ fn validate_source_roots(config: &ArchConfig, roots: &BTreeMap<String, PathBuf>)
             ));
             continue;
         }
-        for source_path in source_files {
-            let bytes = match fs::read(&source_path) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    violations.push(Violation::new(
-                        1,
-                        format!(
-                            "{} line 1: cannot read configured source: {error}",
-                            source_path.display()
-                        ),
-                    ));
-                    continue;
-                }
-            };
-            let source = match String::from_utf8(bytes) {
-                Ok(source) => source,
-                Err(error) => {
-                    violations.push(Violation::new(
-                        1,
-                        format!(
-                            "{} line 1: configured source is not valid UTF-8: {error}",
-                            source_path.display()
-                        ),
-                    ));
-                    continue;
-                }
+        let mut sources = BTreeMap::new();
+        for source_path in &source_files {
+            if let Some(source) = read_configured_source(source_path, &mut violations) {
+                sources.insert(source_path.clone(), source);
+            }
+        }
+        let exclusions = source_exclusions(&sources);
+        let mut pending: BTreeSet<PathBuf> = source_files
+            .into_iter()
+            .filter(|path| !exclusions.contains(path))
+            .collect();
+        let mut visited = BTreeSet::new();
+        while let Some(source_path) = pending.pop_first() {
+            if !visited.insert(source_path.clone()) {
+                continue;
+            }
+            let source = if let Some(source) = sources.get(&source_path) {
+                source.clone()
+            } else if let Some(source) = read_configured_source(&source_path, &mut violations) {
+                sources.insert(source_path.clone(), source.clone());
+                source
+            } else {
+                continue;
             };
             violations.extend(qualify_violations(
                 &source_path,
                 scan_source(&source, &policy.forbidden_tokens),
             ));
+            let (includes, include_violations) =
+                direct_include_sources(&source_path, source_root, &source);
+            violations.extend(qualify_violations(&source_path, include_violations));
+            pending.extend(includes.into_iter().filter(|path| !visited.contains(path)));
         }
     }
     violations
+}
+
+fn read_configured_source(path: &Path, violations: &mut Vec<Violation>) -> Option<String> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            violations.push(Violation::new(
+                1,
+                format!(
+                    "{} line 1: cannot read configured source: {error}",
+                    path.display()
+                ),
+            ));
+            return None;
+        }
+    };
+    match String::from_utf8(bytes) {
+        Ok(source) => Some(source),
+        Err(error) => {
+            violations.push(Violation::new(
+                1,
+                format!(
+                    "{} line 1: configured source is not valid UTF-8: {error}",
+                    path.display()
+                ),
+            ));
+            None
+        }
+    }
+}
+
+#[derive(Default)]
+struct SourceExclusions {
+    files: BTreeSet<PathBuf>,
+    directories: BTreeSet<PathBuf>,
+}
+
+impl SourceExclusions {
+    fn contains(&self, path: &Path) -> bool {
+        self.files.contains(path)
+            || self
+                .directories
+                .iter()
+                .any(|directory| path.starts_with(directory))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ModuleSourceReference {
+    files: [PathBuf; 2],
+    directory: PathBuf,
+    test_only: bool,
+}
+
+fn source_exclusions(sources: &BTreeMap<PathBuf, String>) -> SourceExclusions {
+    let references: Vec<_> = sources
+        .iter()
+        .flat_map(|(path, source)| out_of_line_modules(path, source))
+        .collect();
+    let mut production_files = BTreeSet::new();
+    let mut production_directories = BTreeSet::new();
+    for reference in references.iter().filter(|reference| !reference.test_only) {
+        production_files.extend(reference.files.iter().cloned());
+        production_directories.insert(reference.directory.clone());
+    }
+    let mut exclusions = SourceExclusions::default();
+    for reference in references.iter().filter(|reference| reference.test_only) {
+        for file in &reference.files {
+            if !production_files.contains(file) {
+                exclusions.files.insert(file.clone());
+            }
+        }
+        if !production_directories.contains(&reference.directory) {
+            exclusions.directories.insert(reference.directory.clone());
+        }
+    }
+    exclusions
+}
+
+fn out_of_line_modules(source_path: &Path, source: &str) -> Vec<ModuleSourceReference> {
+    let (cleaned, syntax) = lex_rust(source);
+    let tokens = rust_tokens(&cleaned, &syntax);
+    let mut references = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        let item_start = index;
+        let mut test_only = false;
+        while tokens.get(index).is_some_and(|token| token.text == "#") {
+            let Some(attribute_end) = token_delimiter_end(&tokens, index + 1, "[", "]") else {
+                break;
+            };
+            if is_cfg_test_attribute(&tokens[index..=attribute_end]) {
+                test_only = true;
+            }
+            index = attribute_end + 1;
+        }
+        if tokens.get(index).is_some_and(|token| token.text == "pub") {
+            index += 1;
+            if tokens.get(index).is_some_and(|token| token.text == "(") {
+                index = token_delimiter_end(&tokens, index, "(", ")").map_or(index, |end| end + 1);
+            }
+        }
+        let is_module = tokens.get(index).is_some_and(|token| token.text == "mod")
+            && tokens
+                .get(index + 1)
+                .is_some_and(|token| is_rust_identifier(&token.text))
+            && tokens.get(index + 2).is_some_and(|token| token.text == ";");
+        if is_module {
+            references.push(module_source_reference(
+                source_path,
+                &tokens[index + 1].text,
+                test_only,
+            ));
+            index += 3;
+        } else {
+            index = item_start + 1;
+        }
+    }
+    references
+}
+
+fn token_delimiter_end(
+    tokens: &[RustToken],
+    start: usize,
+    open: &str,
+    close: &str,
+) -> Option<usize> {
+    if tokens.get(start).is_none_or(|token| token.text != open) {
+        return None;
+    }
+    let mut depth = 0_u32;
+    for (index, token) in tokens.iter().enumerate().skip(start) {
+        if token.text == open {
+            depth += 1;
+        } else if token.text == close {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+fn is_cfg_test_attribute(tokens: &[RustToken]) -> bool {
+    let expected = ["#", "[", "cfg", "(", "test", ")", "]"];
+    tokens.len() == expected.len()
+        && tokens
+            .iter()
+            .zip(expected)
+            .all(|(token, expected)| token.text == expected)
+}
+
+fn module_source_reference(
+    source_path: &Path,
+    module: &str,
+    test_only: bool,
+) -> ModuleSourceReference {
+    let parent = source_path.parent().unwrap_or_else(|| Path::new(""));
+    let file_name = source_path.file_name().and_then(OsStr::to_str);
+    let module_base = if matches!(file_name, Some("lib.rs" | "main.rs" | "mod.rs")) {
+        parent.to_path_buf()
+    } else {
+        parent.join(source_path.file_stem().unwrap_or_default())
+    };
+    let directory = module_base.join(module);
+    ModuleSourceReference {
+        files: [
+            module_base.join(format!("{module}.rs")),
+            directory.join("mod.rs"),
+        ],
+        directory,
+        test_only,
+    }
+}
+
+fn direct_include_sources(
+    source_path: &Path,
+    source_root: &Path,
+    source: &str,
+) -> (Vec<PathBuf>, Vec<Violation>) {
+    let (mut cleaned, syntax) = lex_rust(source);
+    mask_cfg_test_items(&mut cleaned, &syntax);
+    let tokens = rust_tokens(&cleaned, &syntax);
+    let mut includes = Vec::new();
+    let mut violations = Vec::new();
+    for window in tokens.windows(3) {
+        if window[0].text != "include"
+            || window[1].text != "!"
+            || !matches!(window[2].text.as_str(), "(" | "{" | "[")
+        {
+            continue;
+        }
+        let argument_start = window[2].offset + window[2].text.len();
+        let Some(argument_start) = next_non_trivia(&cleaned, argument_start) else {
+            violations.push(Violation::new(
+                window[0].line,
+                "include! macro is missing a statically resolvable source path",
+            ));
+            continue;
+        };
+        let Some((relative, _literal_end)) = rust_string_literal(source.as_bytes(), argument_start)
+        else {
+            violations.push(Violation::new(
+                window[0].line,
+                "include! source path must be a direct UTF-8 string literal",
+            ));
+            continue;
+        };
+        let parent = source_path.parent().unwrap_or_else(|| Path::new(""));
+        let resolved = lexical_normalize(&parent.join(relative));
+        let boundary = lexical_normalize(source_root);
+        if !resolved.starts_with(&boundary) {
+            violations.push(Violation::new(
+                window[0].line,
+                format!(
+                    "include! source {} escapes configured source root {}",
+                    resolved.display(),
+                    boundary.display()
+                ),
+            ));
+            continue;
+        }
+        includes.push(resolved);
+    }
+    includes.sort();
+    includes.dedup();
+    (includes, violations)
+}
+
+fn next_non_trivia(source: &[u8], mut index: usize) -> Option<usize> {
+    while source.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+    (index < source.len()).then_some(index)
+}
+
+fn rust_string_literal(bytes: &[u8], start: usize) -> Option<(String, usize)> {
+    if bytes.get(start) == Some(&b'"') {
+        let end = quoted_literal_end(bytes, start, b'"');
+        if end <= start + 1 || bytes.get(end - 1) != Some(&b'"') {
+            return None;
+        }
+        return decode_rust_string(&bytes[start + 1..end - 1]).map(|value| (value, end));
+    }
+    if bytes.get(start) != Some(&b'r') {
+        return None;
+    }
+    let mut quote = start + 1;
+    while bytes.get(quote) == Some(&b'#') {
+        quote += 1;
+    }
+    if bytes.get(quote) != Some(&b'"') {
+        return None;
+    }
+    let end = rust_literal_end(bytes, start)?;
+    let hashes = quote - start - 1;
+    let content_end = end.checked_sub(hashes + 1)?;
+    let value = std::str::from_utf8(bytes.get(quote + 1..content_end)?)
+        .ok()?
+        .to_owned();
+    Some((value, end))
+}
+
+fn decode_rust_string(bytes: &[u8]) -> Option<String> {
+    let mut value = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'\\' {
+            value.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        let escape = *bytes.get(index + 1)?;
+        match escape {
+            b'\\' | b'"' => value.push(escape),
+            b'n' => value.push(b'\n'),
+            b'r' => value.push(b'\r'),
+            b't' => value.push(b'\t'),
+            b'0' => value.push(0),
+            _ => return None,
+        }
+        index += 2;
+    }
+    String::from_utf8(value).ok()
 }
 
 fn collect_rust_sources(
@@ -2084,6 +2640,9 @@ fn rust_literal_end(bytes: &[u8], start: usize) -> Option<usize> {
     if bytes.get(quote_index) == Some(&b'\'') {
         return character_literal_end(bytes, quote_index);
     }
+    if bytes.get(start) == Some(&b'b') && bytes.get(start + 1) == Some(&b'\'') {
+        return character_literal_end(bytes, start + 1);
+    }
     let raw_start = if bytes.get(start) == Some(&b'r') {
         start
     } else if matches!(bytes.get(start), Some(b'b' | b'c')) && bytes.get(start + 1) == Some(&b'r') {
@@ -2127,17 +2686,40 @@ fn quoted_literal_end(bytes: &[u8], quote_index: usize, quote: u8) -> usize {
 }
 
 fn character_literal_end(bytes: &[u8], quote_index: usize) -> Option<usize> {
-    let mut index = quote_index + 1;
-    while index < bytes.len() && bytes[index] != b'\n' {
-        if bytes[index] == b'\\' {
-            index = (index + 2).min(bytes.len());
-        } else if bytes[index] == b'\'' {
-            return Some(index + 1);
-        } else {
-            index += 1;
+    let value_start = quote_index + 1;
+    let value_end = if bytes.get(value_start) == Some(&b'\\') {
+        escaped_character_end(bytes, value_start)?
+    } else {
+        let remainder = std::str::from_utf8(bytes.get(value_start..)?).ok()?;
+        let character = remainder.chars().next()?;
+        if matches!(character, '\'' | '\n' | '\r') {
+            return None;
         }
+        value_start + character.len_utf8()
+    };
+    (bytes.get(value_end) == Some(&b'\'')).then_some(value_end + 1)
+}
+
+fn escaped_character_end(bytes: &[u8], slash: usize) -> Option<usize> {
+    let escape = *bytes.get(slash + 1)?;
+    match escape {
+        b'x' => {
+            bytes.get(slash + 2..slash + 4)?;
+            Some(slash + 4)
+        }
+        b'u' if bytes.get(slash + 2) == Some(&b'{') => {
+            let mut index = slash + 3;
+            while index < bytes.len() && bytes[index] != b'}' {
+                if bytes[index] == b'\n' {
+                    return None;
+                }
+                index += 1;
+            }
+            (bytes.get(index) == Some(&b'}')).then_some(index + 1)
+        }
+        b'\n' | b'\r' => None,
+        _ => Some(slash + 2),
     }
-    None
 }
 
 fn mask_cfg_test_items(cleaned: &mut [u8], syntax: &[bool]) {
@@ -2536,7 +3118,7 @@ fn strip_toml_comment(line: &str) -> &str {
 }
 
 fn parse_table_header(line: &str) -> Option<String> {
-    if line.starts_with("[[") || !line.ends_with(']') {
+    if !line.starts_with('[') || line.starts_with("[[") || line.len() < 2 || !line.ends_with(']') {
         return None;
     }
     let name = line[1..line.len() - 1].trim();
@@ -3336,7 +3918,7 @@ fn production() {
 
     #[test]
     fn arch_r0_05_does_not_mask_production_after_lifetime_test_item() {
-        let source = r#"
+        let source = r"
 pub fn consume<T>() {}
 
 #[cfg(test)]
@@ -3347,7 +3929,7 @@ fn helper<'a>() { consume::<&'a str>() }
 pub fn production() {
     let _ = std::time::SystemTime::now();
 }
-"#;
+";
         let violations = scan_source(
             source,
             &["std::time".to_owned(), "SystemTime::now".to_owned()],
@@ -3410,6 +3992,13 @@ pub fn production() {
     }
 
     #[test]
+    fn arch_r0_05_source_layout_parser_handles_multiline_values() {
+        let manifest = "[package]\nkeywords = [\n    \"relay\",\n]\n";
+        let violations = validate_source_layout(manifest);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
     fn arch_r0_05_real_policy_covers_every_normative_raft_api() {
         let config = parse_arch_config(include_str!("../arch.toml"))
             .expect("real architecture policy must parse");
@@ -3459,6 +4048,38 @@ pub fn production() {
         assert!(
             result.is_ok(),
             "out-of-line cfg(test) was scanned: {result:?}"
+        );
+    }
+
+    #[test]
+    fn arch_r0_05_out_of_line_test_exclusion_does_not_hide_production() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "relay-arch-r0-05-out-of-line-production-{}",
+            std::process::id()
+        ));
+        let source_dir = temp_root.join("crates/relay-core/src");
+        fs::create_dir_all(&source_dir).expect("temporary source tree must be created");
+        fs::write(
+            source_dir.join("lib.rs"),
+            "#[cfg(test)]\nmod tests;\npub fn production() { let _ = SystemTime::now(); }\n",
+        )
+        .expect("crate root must be written");
+        fs::write(
+            source_dir.join("tests.rs"),
+            "#[test]\nfn test_only() { let _ = SystemTime::now(); }\n",
+        )
+        .expect("test module must be written");
+
+        let result =
+            check_source_fixture_files(&temp_root, &fixture_path("../r0_05/arch-source.toml"));
+        fs::remove_dir_all(&temp_root).expect("temporary fixture must be removed");
+        let violations = result.expect_err("production source violation must remain visible");
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].message.contains("lib.rs"), "{violations:?}");
+        assert!(violations[0].message.contains("line 3"), "{violations:?}");
+        assert!(
+            !violations[0].message.contains("tests.rs"),
+            "{violations:?}"
         );
     }
 

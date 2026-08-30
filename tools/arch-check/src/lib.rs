@@ -1210,7 +1210,6 @@ pub fn validate_status_discipline(source: &str) -> Vec<Violation> {
         .lines()
         .take(5)
         .any(|line| line.trim() == "# ADR-NNNN: Title");
-    let is_adr_document = source.lines().take(5).any(is_numbered_adr_heading);
     let mut violations = Vec::new();
     let mut status = None;
     let mut current_heading_level = None;
@@ -1225,11 +1224,7 @@ pub fn validate_status_discipline(source: &str) -> Vec<Violation> {
         if !is_adr_template && !line.trim().is_empty() {
             if let Some(value) = explicit_status_value(raw_line) {
                 paragraph.flush(status, &mut violations);
-                match parse_status_word(&value).or_else(|| {
-                    is_adr_document
-                        .then(|| parse_adr_status_word(&value))
-                        .flatten()
-                }) {
+                match parse_status_word(&value) {
                     Some(parsed) => {
                         status = Some(parsed);
                         status_scope_level = current_heading_level;
@@ -1445,28 +1440,6 @@ fn parse_status_word(value: &str) -> Option<DeliveryStatus> {
         "deferred" => Some(DeliveryStatus::Deferred),
         _ => None,
     }
-}
-
-fn parse_adr_status_word(value: &str) -> Option<DeliveryStatus> {
-    if value == "proposed" {
-        return Some(DeliveryStatus::Planned);
-    }
-    let identifier = value.strip_prefix("superseded by ADR-")?;
-    (identifier.len() == 4 && identifier.bytes().all(|byte| byte.is_ascii_digit()))
-        .then_some(DeliveryStatus::Deferred)
-}
-
-fn is_numbered_adr_heading(line: &str) -> bool {
-    let Some((identifier, title)) = line
-        .trim()
-        .strip_prefix("# ADR-")
-        .and_then(|rest| rest.split_once(':'))
-    else {
-        return false;
-    };
-    identifier.len() == 4
-        && identifier.bytes().all(|byte| byte.is_ascii_digit())
-        && !title.trim().is_empty()
 }
 
 #[derive(Clone, Debug)]
@@ -4669,15 +4642,16 @@ fn production() {
         fs::write(source_dir.join("lib.rs"), [0xff, 0xfe, b'\n'])
             .expect("malformed UTF-8 fixture must be written");
 
-        let output = run_source_fixture(&fixture_path("../r0_05/arch-source.toml"), &temp_root);
+        let result =
+            check_source_fixture_files(&temp_root, &fixture_path("../r0_05/arch-source.toml"));
         fs::remove_dir_all(&temp_root).expect("temporary source tree must be removed");
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let violations = result.expect_err("malformed UTF-8 source must fail closed");
         assert!(
-            !output.status.success(),
-            "malformed UTF-8 source was skipped"
+            violations
+                .iter()
+                .any(|item| item.message.contains("lib.rs") && item.message.contains("UTF-8")),
+            "{violations:?}"
         );
-        assert!(stderr.contains("lib.rs"), "{stderr}");
-        assert!(stderr.contains("UTF-8"), "{stderr}");
     }
 
     #[test]

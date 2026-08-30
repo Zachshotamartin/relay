@@ -1,6 +1,6 @@
 # ADR-0012: Decouple cargo-deny from the Product MSRV
 
-- Status: proposed
+- Status: in progress
 - Date: 2026-08-30
 - Related findings or requirements: NFR-SEC-008, NFR-MAINT-004
 

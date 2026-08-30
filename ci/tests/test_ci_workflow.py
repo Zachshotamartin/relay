@@ -58,6 +58,7 @@ class WorkflowGraphTests(unittest.TestCase):
             if action_ref.startswith("./"):
                 continue
             self.assertRegex(action_ref, r"^[^@\s]+@[0-9a-f]{40}$")
+        self.assertEqual(7, workflow.count("persist-credentials: false"))
         self.assertIn("toolchain: 1.85.0", workflow)
         self.assertIn("just-version: 1.36.0", workflow)
         self.assertNotIn("${{ secrets.", workflow)
@@ -95,6 +96,14 @@ class WorkflowGraphTests(unittest.TestCase):
         self.assertRegex(workflow, r"(?m)^permissions:\n  contents: read$")
         self.assertNotIn("pull_request_target", workflow)
         self.assertNotRegex(gates, r"(?i)cache")
+        self.assertIn(
+            "cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz",
+            gates,
+        )
+        self.assertIn(
+            "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f",
+            gates,
+        )
         self.assertRegex(gates, r"(?m)^      - run: just gates$")
 
     def test_r0_ci_05_just_recipes_preserve_locked_gate_commands(self) -> None:

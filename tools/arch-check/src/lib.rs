@@ -5442,9 +5442,14 @@ forbidden-tokens = []
         assert_eq!(uppercase[0].line, 1);
 
         let proposed_adr = "# ADR-0012: Tool compatibility\n\n- Status: proposed\n";
+        let proposed_violations = validate_status_discipline(proposed_adr);
+        assert_eq!(proposed_violations.len(), 1, "{proposed_violations:?}");
+        assert_eq!(proposed_violations[0].line, 3);
+
+        let in_progress_adr = "# ADR-0012: Tool compatibility\n\n- Status: in progress\n";
         assert!(
-            validate_status_discipline(proposed_adr).is_empty(),
-            "a proposed ADR is a valid decision status"
+            validate_status_discipline(in_progress_adr).is_empty(),
+            "an in-progress ADR uses the repository-wide status vocabulary"
         );
     }
 

@@ -3957,6 +3957,24 @@ pub fn production() {
     }
 
     #[test]
+    fn arch_r0_05_rejects_std_aliases_and_unresolved_path_attributes() {
+        let aliased = concat!(
+            "use std as platform;\n",
+            "use platform::time::SystemTime as Clock;\n",
+            "fn production() { let _ = Clock::now(); }\n",
+        );
+        let alias_violations = scan_source(aliased, &["std::time".to_owned()]);
+        assert_eq!(alias_violations.len(), 1, "{alias_violations:?}");
+        assert_eq!(alias_violations[0].line, 1);
+
+        let indirect = "#[path = \"generated/production.rs\"]\nmod production;\nfn harmless() {}\n";
+        let path_violations = scan_source(indirect, &["std::time".to_owned()]);
+        assert_eq!(path_violations.len(), 1, "{path_violations:?}");
+        assert_eq!(path_violations[0].line, 1);
+        assert!(path_violations[0].message.contains("#[path]"));
+    }
+
+    #[test]
     fn arch_r0_05_scans_included_rust_sources_without_rs_extension() {
         let temp_root =
             std::env::temp_dir().join(format!("relay-arch-r0-05-include-{}", std::process::id()));
@@ -3996,6 +4014,13 @@ pub fn production() {
         let manifest = "[package]\nkeywords = [\n    \"relay\",\n]\n";
         let violations = validate_source_layout(manifest);
         assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn arch_r0_05_rejects_dotted_custom_build_script_path() {
+        let violations = validate_source_layout("package.build = \"build/custom.rs\"\n");
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].message.contains("build script"));
     }
 
     #[test]

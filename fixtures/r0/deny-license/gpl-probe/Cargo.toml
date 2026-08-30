@@ -1,0 +1,11 @@
+[package]
+name = "relay-r0-gpl-probe"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-only"
+publish = false
+
+[lib]
+path = "lib.rs"
+

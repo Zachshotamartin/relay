@@ -1,0 +1,4 @@
+[crate.relay-core]
+allowed-deps = []
+forbidden-deps = []
+forbidden-tokens = ["SystemTime::now"]

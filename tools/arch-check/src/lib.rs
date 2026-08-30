@@ -1427,9 +1427,12 @@ impl<'a> JsonParser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
     use std::sync::Mutex;
+
+    static FIXTURE_PROCESS_LOCK: Mutex<()> = Mutex::new(());
 
     fn fixture_path(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1438,7 +1441,6 @@ mod tests {
     }
 
     fn run_arch_fixture(metadata: &str, config: &Path) -> Output {
-        static FIXTURE_PROCESS_LOCK: Mutex<()> = Mutex::new(());
         let _guard = FIXTURE_PROCESS_LOCK
             .lock()
             .expect("fixture process lock must not be poisoned");
@@ -1463,6 +1465,33 @@ mod tests {
             .current_dir(workspace_root)
             .output()
             .expect("fixture invocation must start")
+    }
+
+    fn run_source_fixture(config: &Path, source_root: &Path) -> Output {
+        let _guard = FIXTURE_PROCESS_LOCK
+            .lock()
+            .expect("fixture process lock must not be poisoned");
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = manifest_dir
+            .parent()
+            .and_then(Path::parent)
+            .expect("arch-check must live at tools/arch-check");
+        Command::new(env!("CARGO"))
+            .args([
+                "run",
+                "--quiet",
+                "--locked",
+                "-p",
+                "arch-check",
+                "--",
+                "--source-fixture-root",
+            ])
+            .arg(source_root)
+            .arg("--config")
+            .arg(config)
+            .current_dir(workspace_root)
+            .output()
+            .expect("source-fixture invocation must start")
     }
 
     #[test]
@@ -1532,6 +1561,108 @@ mod tests {
         );
         assert!(stderr.contains("unreadable-directory"), "{stderr}");
         assert!(stderr.contains("cannot read"), "{stderr}");
+    }
+
+    #[test]
+    fn arch_r0_05_detects_every_configured_forbidden_token() {
+        let config = parse_arch_config(include_str!("../arch.toml"))
+            .expect("real architecture policy must parse");
+        let mut checked = 0;
+        for (crate_name, policy) in config.crates {
+            for token in policy.forbidden_tokens {
+                checked += 1;
+                let source = format!("fn harmless() {{}}\nfn violation() {{ {token}; }}\n");
+                let violations = scan_source(&source, std::slice::from_ref(&token));
+                assert_eq!(
+                    violations.len(),
+                    1,
+                    "crate {crate_name} token {token:?} was not detected: {violations:?}"
+                );
+                assert_eq!(violations[0].line, 2, "crate {crate_name} token {token:?}");
+                assert!(
+                    violations[0].message.contains(&token),
+                    "crate {crate_name} token {token:?}: {:?}",
+                    violations[0]
+                );
+            }
+        }
+        assert!(
+            checked > 0,
+            "the real policy must configure forbidden tokens"
+        );
+    }
+
+    #[test]
+    fn arch_r0_05_ignores_comments_and_nested_cfg_test_items() {
+        let source = r#"// SystemTime::now in a line comment
+/// SystemTime::now in a doc comment
+//! SystemTime::now in an inner doc comment
+/* SystemTime::now in an outer block
+   /* SystemTime::now in a nested block */
+*/
+#[cfg(test)]
+mod tests {
+    fn helper() { SystemTime::now(); }
+    #[cfg(test)]
+    fn nested_helper() { SystemTime::now(); }
+}
+#[cfg(test)]
+fn test_only_item() { SystemTime::now(); }
+fn production() {
+    SystemTime::now();
+}
+"#;
+        let violations = scan_source(source, &["SystemTime::now".to_owned()]);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].line, 16);
+    }
+
+    #[test]
+    fn arch_r0_05_traverses_configured_source_tree_with_file_and_line() {
+        let source_root = fixture_path("../r0_05/source-bad");
+        let output = run_source_fixture(&fixture_path("../r0_05/arch-source.toml"), &source_root);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "forbidden source tree was accepted"
+        );
+        assert!(stderr.contains("crates/relay-core/src/lib.rs"), "{stderr}");
+        assert!(stderr.contains("line 4"), "{stderr}");
+        assert!(stderr.contains("SystemTime::now"), "{stderr}");
+    }
+
+    #[test]
+    fn arch_r0_05_missing_source_tree_fails_closed() {
+        let source_root = fixture_path("../r0_05/source-missing");
+        let output = run_source_fixture(&fixture_path("../r0_05/arch-source.toml"), &source_root);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "missing configured source was skipped"
+        );
+        assert!(stderr.contains("relay-core"), "{stderr}");
+        assert!(stderr.contains("source"), "{stderr}");
+        assert!(stderr.contains("missing"), "{stderr}");
+    }
+
+    #[test]
+    fn arch_r0_05_malformed_utf8_source_fails_closed() {
+        let temp_root =
+            std::env::temp_dir().join(format!("relay-arch-r0-05-utf8-{}", std::process::id()));
+        let source_dir = temp_root.join("crates/relay-core/src");
+        fs::create_dir_all(&source_dir).expect("temporary source tree must be created");
+        fs::write(source_dir.join("lib.rs"), [0xff, 0xfe, b'\n'])
+            .expect("malformed UTF-8 fixture must be written");
+
+        let output = run_source_fixture(&fixture_path("../r0_05/arch-source.toml"), &temp_root);
+        fs::remove_dir_all(&temp_root).expect("temporary source tree must be removed");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "malformed UTF-8 source was skipped"
+        );
+        assert!(stderr.contains("lib.rs"), "{stderr}");
+        assert!(stderr.contains("UTF-8"), "{stderr}");
     }
 
     fn metadata_with_workspace_packages(package_names: &[&str]) -> String {

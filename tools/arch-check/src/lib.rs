@@ -361,6 +361,12 @@ pub fn validate_dependency_graph(
     let configured_crates: BTreeSet<&str> = config.crates.keys().map(String::as_str).collect();
     let is_full_product_policy = configured_crates == product_crates;
 
+    for configured_crate in configured_crates.difference(&product_crates) {
+        violations.push(Violation::new(
+            1,
+            format!("architecture policy configures rogue crate {configured_crate}"),
+        ));
+    }
     for package_name in metadata.packages.keys() {
         if package_name == TOOL_CRATE {
             continue;

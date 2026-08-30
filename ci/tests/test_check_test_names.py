@@ -217,6 +217,41 @@ mark!(test);
         self.assertEqual(["bad_name"], [item.name for item in violations])
         self.assertEqual([4], [item.line for item in violations])
 
+    def test_r0_name_13_rejects_dynamic_qualified_test_attributes(self) -> None:
+        source = """macro_rules! mark {
+    ($kind:ident) => {
+        #[tokio::$kind]
+        async fn bad_name() {}
+    };
+}
+mark!(test);
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tests" / "qualified_attribute.rs"
+            path.parent.mkdir()
+            path.write_text(source, encoding="utf-8")
+
+            violations = check_test_names.find_violations(Path(directory))
+
+        self.assertEqual(["bad_name"], [item.name for item in violations])
+        self.assertEqual([4], [item.line for item in violations])
+
+    def test_r0_name_14_rejects_renamed_test_attributes(self) -> None:
+        source = """use tokio::test as relay_test;
+
+#[relay_test]
+async fn bad_name() {}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tests" / "aliased_attribute.rs"
+            path.parent.mkdir()
+            path.write_text(source, encoding="utf-8")
+
+            violations = check_test_names.find_violations(Path(directory))
+
+        self.assertEqual(["bad_name"], [item.name for item in violations])
+        self.assertEqual([4], [item.line for item in violations])
+
 
 if __name__ == "__main__":
     unittest.main()

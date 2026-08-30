@@ -114,7 +114,10 @@ class WorkflowGraphTests(unittest.TestCase):
             "msrv": "cargo check --workspace --locked",
             "deny": "cargo deny check",
             "arch": "cargo run -p arch-check --locked",
-            "test": "cargo test --workspace --locked",
+            "test": (
+                "python3 ci/check_test_names.py .\n"
+                "    python3 ci/check_canaries.py --capture -- cargo test --workspace --locked"
+            ),
             "gates": "python3 ci/run_gates.py",
         }
         for recipe, command in required.items():

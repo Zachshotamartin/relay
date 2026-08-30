@@ -114,6 +114,11 @@ jobs:
         with:
           just-version: 1.36.0
       - run: just arch
+      - run: just pr-policy
+        if: github.event_name == 'pull_request'
+        env:
+          RELAY_PR_TITLE: ${{ github.event.pull_request.title }}
+          RELAY_PR_BODY: ${{ github.event.pull_request.body }}
 
   test:
     name: test (${{ matrix.platform }})

@@ -5560,6 +5560,21 @@ forbidden-tokens = []
         let violations = validate_test_names("#[test]\nfn unnamed_test() {}\n");
         assert_eq!(violations.len(), 1);
         assert!(validate_test_names("#[test]\nfn core_001_body_limit() {}\n").is_empty());
+
+        let mixed = concat!(
+            "// #[test]\n",
+            "// fn comment_is_not_a_test() {}\n",
+            "#[cfg(test)]\n",
+            "fn helper_without_test_attribute() {}\n",
+            "#[tokio::test]\n",
+            "async fn wire_partial_frame() {}\n",
+            "#[test]\n",
+            "fn receipt_is_rejected() {}\n",
+        );
+        let mixed_violations = validate_test_names(mixed);
+        assert_eq!(mixed_violations.len(), 1, "{mixed_violations:?}");
+        assert_eq!(mixed_violations[0].line, 8);
+        assert!(mixed_violations[0].message.contains("receipt_is_rejected"));
     }
 
     #[test]
@@ -5567,5 +5582,15 @@ forbidden-tokens = []
         let violations = scan_canaries("ordinary output\nRELAY_CANARY_secret\n");
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].line, 2);
+        assert!(!violations[0].message.contains("secret"));
+
+        let repeated =
+            scan_canaries("RELAY_CANARY_first RELAY_CANARY_second\nclean\nRELAY_CANARY_third\n");
+        assert_eq!(repeated.len(), 2, "{repeated:?}");
+        assert_eq!(repeated[0].line, 1);
+        assert_eq!(repeated[1].line, 3);
+        assert!(repeated.iter().all(|item| !item.message.contains("first")
+            && !item.message.contains("second")
+            && !item.message.contains("third")));
     }
 }

@@ -47,6 +47,35 @@ _FUNCTION_DECLARATION = re.compile(
     r"fn\b"
 )
 _TEST_ATTRIBUTE_NAMES = {"test", "rstest", "proptest", "test_case"}
+_NON_TEST_FUNCTION_ATTRIBUTE_NAMES = {
+    "allow",
+    "cfg",
+    "cold",
+    "coverage",
+    "deny",
+    "deprecated",
+    "diagnostic",
+    "doc",
+    "expect",
+    "export_name",
+    "forbid",
+    "ignore",
+    "inline",
+    "instruction_set",
+    "link_name",
+    "link_section",
+    "must_use",
+    "naked",
+    "no_mangle",
+    "optimize",
+    "proc_macro",
+    "proc_macro_attribute",
+    "should_panic",
+    "target_feature",
+    "track_caller",
+    "used",
+    "warn",
+}
 
 
 class ScanError(RuntimeError):
@@ -225,7 +254,7 @@ def _is_test_attribute(contents: str) -> bool:
 
 
 def _is_potential_test_attribute(contents: str) -> bool:
-    """Recognize tests plus macro-generated attributes that could become tests."""
+    """Recognize tests plus attributes that cannot be proven to be non-tests."""
 
     if _is_test_attribute(contents):
         return True
@@ -233,9 +262,15 @@ def _is_potential_test_attribute(contents: str) -> bool:
     if match is None:
         return "$" in contents
     segments = re.findall(_IDENTIFIER, match.group("path"))
-    if not segments or segments[-1].removeprefix("r#") != "cfg_attr":
+    if not segments:
         return False
-    arguments = _top_level_arguments(contents[match.end() :].lstrip())
+    attribute_name = segments[-1].removeprefix("r#")
+    remainder = contents[match.end() :].lstrip()
+    if remainder.startswith("::") and "$" in remainder:
+        return True
+    if attribute_name != "cfg_attr":
+        return attribute_name not in _NON_TEST_FUNCTION_ATTRIBUTE_NAMES
+    arguments = _top_level_arguments(remainder)
     if arguments is None or len(arguments) < 2:
         return False
     return any(_is_potential_test_attribute(argument) for argument in arguments[1:])

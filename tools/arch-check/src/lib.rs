@@ -1421,6 +1421,7 @@ fn validate_accepted_gate_prefix(
     violations: &mut Vec<Violation>,
 ) {
     let mut first_unaccepted = None;
+    let mut in_progress_gate = None;
     for number in 0..=10 {
         let gate_name = format!("R{number}");
         let Some(builder) = gates.get(&gate_name) else {
@@ -1434,6 +1435,27 @@ fn validate_accepted_gate_prefix(
                         "accepted gate {gate_name} is not a prefix because earlier gate {earlier_gate} is unaccepted"
                     ),
                 ));
+            }
+        } else if builder.status == Some(DeliveryStatus::InProgress) {
+            if let Some(ref earlier_gate) = in_progress_gate {
+                violations.push(Violation::new(
+                    builder.status_line.unwrap_or(builder.line),
+                    format!(
+                        "gate {gate_name} cannot be in progress while earlier gate {earlier_gate} is in progress"
+                    ),
+                ));
+            } else if let Some(ref earlier_gate) = first_unaccepted {
+                violations.push(Violation::new(
+                    builder.status_line.unwrap_or(builder.line),
+                    format!(
+                        "gate {gate_name} cannot be in progress before earlier gate {earlier_gate} is accepted"
+                    ),
+                ));
+            } else {
+                in_progress_gate = Some(gate_name.clone());
+            }
+            if first_unaccepted.is_none() {
+                first_unaccepted = Some(gate_name);
             }
         } else if first_unaccepted.is_none() {
             first_unaccepted = Some(gate_name);
@@ -1563,9 +1585,14 @@ fn markdown_links(source: &str) -> (Vec<MarkdownLink>, Vec<Violation>) {
         }
     }
     let mut used_definitions = BTreeSet::new();
-    for (_, label) in references {
+    for (line, label) in references {
         if definitions.contains_key(&label) {
             used_definitions.insert(label);
+        } else {
+            violations.push(Violation::new(
+                line,
+                format!("Markdown reference [{label}] has no definition"),
+            ));
         }
     }
     for label in used_definitions {

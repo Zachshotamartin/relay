@@ -100,6 +100,7 @@ jobs:
           install -m 0755 \
             "${RUNNER_TEMP}/cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny" \
             "${HOME}/.cargo/bin/cargo-deny"
+          cargo deny --version
       - run: just deny
 
   arch:

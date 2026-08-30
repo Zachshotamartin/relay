@@ -7,6 +7,20 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const PRODUCT_CRATES: [&str; 10] = [
+    "relay-core",
+    "relay-wal",
+    "relay-raft",
+    "relay-sim",
+    "relay-model",
+    "relay-wire",
+    "relay-server",
+    "relay-client",
+    "relay-cli",
+    "relay-bench",
+];
+const TOOL_CRATE: &str = "arch-check";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Violation {
     pub line: usize,
@@ -25,6 +39,8 @@ impl Violation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CratePolicy {
     pub allowed_deps: BTreeSet<String>,
+    pub allowed_dev_deps: BTreeSet<String>,
+    pub allowed_build_deps: BTreeSet<String>,
     pub forbidden_deps: BTreeSet<String>,
     pub forbidden_tokens: Vec<String>,
 }
@@ -38,7 +54,30 @@ pub struct ArchConfig {
 pub struct MetadataPackage {
     pub name: String,
     pub manifest_path: PathBuf,
-    pub dependencies: BTreeSet<String>,
+    pub dependencies: BTreeSet<MetadataDependency>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum DependencyKind {
+    Normal,
+    Development,
+    Build,
+}
+
+impl DependencyKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Development => "dev",
+            Self::Build => "build",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct MetadataDependency {
+    pub name: String,
+    pub kind: DependencyKind,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,6 +89,7 @@ pub struct WorkspaceMetadata {
 pub fn check_exact_requirements(manifest: &str) -> Vec<Violation> {
     let mut violations = Vec::new();
     let mut section = String::new();
+    let mut table_requirements: BTreeMap<String, TableRequirement> = BTreeMap::new();
     let lines: Vec<&str> = manifest.lines().collect();
     let mut index = 0;
 
@@ -64,6 +104,11 @@ pub fn check_exact_requirements(manifest: &str) -> Vec<Violation> {
         if line.starts_with('[') {
             if let Some(name) = parse_table_header(line) {
                 section = name;
+                if let Some(dependency) = dependency_table_name(&section) {
+                    table_requirements
+                        .entry(dependency)
+                        .or_insert_with(|| TableRequirement::new(line_number));
+                }
             }
             index += 1;
             continue;
@@ -73,7 +118,7 @@ pub fn check_exact_requirements(manifest: &str) -> Vec<Violation> {
             index += 1;
             continue;
         };
-        let Some(dependency) = dependency_name(&section, key.trim()) else {
+        let Some(assignment) = dependency_assignment(&section, key.trim()) else {
             index += 1;
             continue;
         };
@@ -84,6 +129,7 @@ pub fn check_exact_requirements(manifest: &str) -> Vec<Violation> {
             value.push_str(strip_toml_comment(lines[end]).trim());
         }
         if delimiters_unbalanced(&value) {
+            let dependency = assignment.dependency();
             violations.push(Violation::new(
                 line_number,
                 format!("dependency {dependency} has an unterminated requirement"),
@@ -92,22 +138,20 @@ pub fn check_exact_requirements(manifest: &str) -> Vec<Violation> {
             continue;
         }
 
-        match dependency_requirement(&value) {
-            Ok(Some(requirement)) if !is_exact_version(&requirement) => {
-                violations.push(Violation::new(
-                    line_number,
-                    format!(
-                        "dependency {dependency} must use an exact =x.y.z requirement, found {requirement:?}"
-                    ),
-                ));
-            }
-            Ok(_) => {}
-            Err(message) => violations.push(Violation::new(
-                line_number,
-                format!("dependency {dependency}: {message}"),
-            )),
-        }
+        process_dependency_assignment(
+            assignment,
+            &value,
+            line_number,
+            &mut table_requirements,
+            &mut violations,
+        );
         index = end + 1;
+    }
+
+    for (dependency, requirement) in table_requirements {
+        if !requirement.version_seen && !requirement.inherited {
+            violations.push(missing_requirement(&dependency, requirement.line));
+        }
     }
     violations
 }
@@ -264,10 +308,29 @@ pub fn parse_cargo_metadata(source: &str) -> Result<WorkspaceMetadata, String> {
             .ok_or_else(|| format!("package {name} is missing dependencies"))?
             .iter()
             .map(|dependency| {
-                dependency
+                let object = dependency
                     .as_object()
-                    .ok_or_else(|| format!("package {name} dependency is not an object"))
-                    .and_then(|object| json_string_field(object, "name").map(str::to_owned))
+                    .ok_or_else(|| format!("package {name} dependency is not an object"))?;
+                let dependency_name = json_string_field(object, "name")?.to_owned();
+                let kind = match object.get("kind") {
+                    Some(JsonValue::Null) | None => DependencyKind::Normal,
+                    Some(JsonValue::String(kind)) if kind == "dev" => DependencyKind::Development,
+                    Some(JsonValue::String(kind)) if kind == "build" => DependencyKind::Build,
+                    Some(JsonValue::String(kind)) => {
+                        return Err(format!(
+                            "package {name} dependency {dependency_name} has unknown kind {kind:?}"
+                        ));
+                    }
+                    Some(_) => {
+                        return Err(format!(
+                            "package {name} dependency {dependency_name} kind must be null or a string"
+                        ));
+                    }
+                };
+                Ok(MetadataDependency {
+                    name: dependency_name,
+                    kind,
+                })
             })
             .collect::<Result<BTreeSet<_>, _>>()?;
         let parsed = MetadataPackage {
@@ -294,6 +357,28 @@ pub fn validate_dependency_graph(
     metadata: &WorkspaceMetadata,
 ) -> Vec<Violation> {
     let mut violations = Vec::new();
+    let product_crates: BTreeSet<&str> = PRODUCT_CRATES.into_iter().collect();
+    let configured_crates: BTreeSet<&str> = config.crates.keys().map(String::as_str).collect();
+    let is_full_product_policy = configured_crates == product_crates;
+
+    for package_name in metadata.packages.keys() {
+        if package_name == TOOL_CRATE {
+            continue;
+        }
+        if !config.crates.contains_key(package_name) {
+            violations.push(Violation::new(
+                1,
+                format!("workspace package {package_name} has no architecture policy"),
+            ));
+        }
+    }
+    if is_full_product_policy && !metadata.packages.contains_key(TOOL_CRATE) {
+        violations.push(Violation::new(
+            1,
+            "real workspace metadata is missing required arch-check package",
+        ));
+    }
+
     for (crate_name, policy) in &config.crates {
         let Some(package) = metadata.packages.get(crate_name) else {
             violations.push(Violation::new(
@@ -303,15 +388,33 @@ pub fn validate_dependency_graph(
             continue;
         };
         for dependency in &package.dependencies {
-            if policy.forbidden_deps.contains(dependency) {
+            if policy.forbidden_deps.contains(&dependency.name) {
                 violations.push(Violation::new(
                     1,
-                    format!("crate {crate_name} has forbidden dependency {dependency}"),
+                    format!(
+                        "crate {crate_name} has forbidden {} dependency {}",
+                        dependency.kind.label(),
+                        dependency.name
+                    ),
                 ));
-            } else if !policy.allowed_deps.contains(dependency) {
+                continue;
+            }
+            let allowed = policy.allowed_deps.contains(&dependency.name)
+                || match dependency.kind {
+                    DependencyKind::Normal => false,
+                    DependencyKind::Development => {
+                        policy.allowed_dev_deps.contains(&dependency.name)
+                    }
+                    DependencyKind::Build => policy.allowed_build_deps.contains(&dependency.name),
+                };
+            if !allowed {
                 violations.push(Violation::new(
                     1,
-                    format!("crate {crate_name} dependency {dependency} is not allowlisted"),
+                    format!(
+                        "crate {crate_name} {} dependency {} is not allowlisted",
+                        dependency.kind.label(),
+                        dependency.name
+                    ),
                 ));
             }
         }
@@ -474,15 +577,103 @@ fn qualify_violations(path: &Path, violations: Vec<Violation>) -> Vec<Violation>
         .collect()
 }
 
-fn dependency_requirement(value: &str) -> Result<Option<String>, String> {
+#[derive(Clone, Debug)]
+struct ParsedRequirement {
+    version: Option<String>,
+    inherited: bool,
+}
+
+#[derive(Clone, Debug)]
+struct TableRequirement {
+    line: usize,
+    version_seen: bool,
+    inherited: bool,
+}
+
+impl TableRequirement {
+    fn new(line: usize) -> Self {
+        Self {
+            line,
+            version_seen: false,
+            inherited: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum DependencyAssignment {
+    Direct(String),
+    Field { dependency: String, field: String },
+}
+
+impl DependencyAssignment {
+    fn dependency(&self) -> &str {
+        match self {
+            Self::Direct(dependency) | Self::Field { dependency, .. } => dependency,
+        }
+    }
+}
+
+fn process_dependency_assignment(
+    assignment: DependencyAssignment,
+    value: &str,
+    line: usize,
+    table_requirements: &mut BTreeMap<String, TableRequirement>,
+    violations: &mut Vec<Violation>,
+) {
+    match assignment {
+        DependencyAssignment::Direct(dependency) => match parse_direct_requirement(value) {
+            Ok(requirement) => {
+                validate_parsed_requirement(&dependency, line, &requirement, violations);
+            }
+            Err(message) => violations.push(Violation::new(
+                line,
+                format!("dependency {dependency}: {message}"),
+            )),
+        },
+        DependencyAssignment::Field { dependency, field } => {
+            let requirement = table_requirements
+                .entry(dependency.clone())
+                .or_insert_with(|| TableRequirement::new(line));
+            match field.as_str() {
+                "version" => {
+                    requirement.version_seen = true;
+                    match parse_toml_string(value.trim()) {
+                        Ok(version) if !is_exact_version(&version) => {
+                            violations.push(inexact_requirement(&dependency, line, &version));
+                        }
+                        Ok(_) => {}
+                        Err(message) => violations.push(Violation::new(
+                            line,
+                            format!("dependency {dependency}: {message}"),
+                        )),
+                    }
+                }
+                "workspace" => match parse_toml_bool(value.trim()) {
+                    Ok(inherited) => requirement.inherited = inherited,
+                    Err(message) => violations.push(Violation::new(
+                        line,
+                        format!("dependency {dependency}: {message}"),
+                    )),
+                },
+                _ => {}
+            }
+        }
+    }
+}
+
+fn parse_direct_requirement(value: &str) -> Result<ParsedRequirement, String> {
     let value = value.trim();
     if value.starts_with('"') || value.starts_with('\'') {
-        return parse_toml_string(value).map(Some);
+        return parse_toml_string(value).map(|version| ParsedRequirement {
+            version: Some(version),
+            inherited: false,
+        });
     }
     if value.starts_with('{') && value.ends_with('}') {
         let fields = split_top_level(&value[1..value.len() - 1], ',')?;
         let mut version = None;
-        let mut workspace = false;
+        let mut inherited = false;
         for field in fields {
             if field.trim().is_empty() {
                 continue;
@@ -492,20 +683,53 @@ fn dependency_requirement(value: &str) -> Result<Option<String>, String> {
             };
             match key.trim() {
                 "version" => version = Some(parse_toml_string(field_value.trim())?),
-                "workspace" => match field_value.trim() {
-                    "true" => workspace = true,
-                    "false" => {}
-                    _ => return Err("workspace must be a boolean".to_owned()),
-                },
+                "workspace" => inherited = parse_toml_bool(field_value.trim())?,
                 _ => {}
             }
         }
-        if workspace && version.is_none() {
-            return Ok(None);
-        }
-        return Ok(version);
+        return Ok(ParsedRequirement { version, inherited });
     }
     Err("requirement must be a string or inline table".to_owned())
+}
+
+fn parse_toml_bool(value: &str) -> Result<bool, String> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err("workspace must be a boolean".to_owned()),
+    }
+}
+
+fn validate_parsed_requirement(
+    dependency: &str,
+    line: usize,
+    requirement: &ParsedRequirement,
+    violations: &mut Vec<Violation>,
+) {
+    match &requirement.version {
+        Some(version) if !is_exact_version(version) => {
+            violations.push(inexact_requirement(dependency, line, version));
+        }
+        Some(_) => {}
+        None if requirement.inherited => {}
+        None => violations.push(missing_requirement(dependency, line)),
+    }
+}
+
+fn inexact_requirement(dependency: &str, line: usize, version: &str) -> Violation {
+    Violation::new(
+        line,
+        format!("dependency {dependency} must use an exact =x.y.z requirement, found {version:?}"),
+    )
+}
+
+fn missing_requirement(dependency: &str, line: usize) -> Violation {
+    Violation::new(
+        line,
+        format!(
+            "dependency {dependency} is missing an exact version; only workspace = true may inherit one"
+        ),
+    )
 }
 
 fn is_exact_version(requirement: &str) -> bool {
@@ -531,7 +755,7 @@ fn is_exact_version(requirement: &str) -> bool {
     )
 }
 
-fn dependency_name(section: &str, key: &str) -> Option<String> {
+fn dependency_assignment(section: &str, key: &str) -> Option<DependencyAssignment> {
     let components = toml_table_components(section);
     let dependency_index = components.iter().position(|component| {
         matches!(
@@ -540,10 +764,60 @@ fn dependency_name(section: &str, key: &str) -> Option<String> {
         )
     })?;
     if dependency_index + 1 < components.len() {
-        Some(components[dependency_index + 1].clone())
+        Some(DependencyAssignment::Field {
+            dependency: components[dependency_index + 1].clone(),
+            field: unquote_toml_key(key),
+        })
     } else {
-        Some(unquote_toml_key(key))
+        let key_components = toml_dotted_key_components(key);
+        let dependency = key_components.first()?.clone();
+        if key_components.len() == 1 {
+            Some(DependencyAssignment::Direct(dependency))
+        } else {
+            Some(DependencyAssignment::Field {
+                dependency,
+                field: key_components[1].clone(),
+            })
+        }
     }
+}
+
+fn dependency_table_name(section: &str) -> Option<String> {
+    let components = toml_table_components(section);
+    let dependency_index = components.iter().position(|component| {
+        matches!(
+            component.as_str(),
+            "dependencies" | "dev-dependencies" | "build-dependencies"
+        )
+    })?;
+    components.get(dependency_index + 1).cloned()
+}
+
+fn toml_dotted_key_components(key: &str) -> Vec<String> {
+    let mut components = Vec::new();
+    let mut start = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in key.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quote == Some('"') && character == '\\' {
+            escaped = true;
+        } else if matches!(character, '\'' | '"') {
+            if quote == Some(character) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(character);
+            }
+        } else if character == '.' && quote.is_none() {
+            components.push(unquote_toml_key(&key[start..index]));
+            start = index + 1;
+        }
+    }
+    components.push(unquote_toml_key(&key[start..]));
+    components
 }
 
 fn toml_table_components(section: &str) -> Vec<String> {
@@ -692,12 +966,20 @@ fn parse_string_array(value: &str) -> Result<Vec<String>, String> {
     if !value.starts_with('[') || !value.ends_with(']') {
         return Err("policy values must be arrays of strings".to_owned());
     }
-    let entries = split_top_level(&value[1..value.len() - 1], ',')?;
+    let inner = &value[1..value.len() - 1];
+    if inner.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let entries = split_top_level(inner, ',')?;
     let mut parsed = Vec::new();
     let mut seen = BTreeSet::new();
-    for entry in entries {
+    let entry_count = entries.len();
+    for (index, entry) in entries.into_iter().enumerate() {
         if entry.trim().is_empty() {
-            continue;
+            if index + 1 == entry_count && inner.trim_end().ends_with(',') {
+                continue;
+            }
+            return Err("policy array contains an empty array entry".to_owned());
         }
         let item = parse_toml_string(entry.trim())?;
         if item.is_empty() {
@@ -763,6 +1045,8 @@ fn split_top_level(value: &str, delimiter: char) -> Result<Vec<&str>, String> {
 struct PolicyBuilder {
     line: usize,
     allowed_deps: Option<Vec<String>>,
+    allowed_dev_deps: Option<Vec<String>>,
+    allowed_build_deps: Option<Vec<String>>,
     forbidden_deps: Option<Vec<String>>,
     forbidden_tokens: Option<Vec<String>>,
 }
@@ -772,6 +1056,8 @@ impl PolicyBuilder {
         Self {
             line,
             allowed_deps: None,
+            allowed_dev_deps: None,
+            allowed_build_deps: None,
             forbidden_deps: None,
             forbidden_tokens: None,
         }
@@ -786,6 +1072,8 @@ impl PolicyBuilder {
     ) {
         let slot = match key {
             "allowed-deps" => &mut self.allowed_deps,
+            "allowed-dev-deps" => &mut self.allowed_dev_deps,
+            "allowed-build-deps" => &mut self.allowed_build_deps,
             "forbidden-deps" => &mut self.forbidden_deps,
             "forbidden-tokens" => &mut self.forbidden_tokens,
             _ => {
@@ -819,13 +1107,41 @@ impl PolicyBuilder {
             ));
             return None;
         };
+        let allowed_deps: BTreeSet<String> = allowed_deps.into_iter().collect();
+        let allowed_dev_deps: BTreeSet<String> = self
+            .allowed_dev_deps
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let allowed_build_deps: BTreeSet<String> = self
+            .allowed_build_deps
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let forbidden_deps: BTreeSet<String> = self
+            .forbidden_deps
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        for dependency in allowed_deps
+            .iter()
+            .chain(&allowed_dev_deps)
+            .chain(&allowed_build_deps)
+        {
+            if forbidden_deps.contains(dependency) {
+                violations.push(Violation::new(
+                    self.line,
+                    format!(
+                        "crate policy {name} lists dependency {dependency} in both allowed and forbidden sets"
+                    ),
+                ));
+            }
+        }
         Some(CratePolicy {
-            allowed_deps: allowed_deps.into_iter().collect(),
-            forbidden_deps: self
-                .forbidden_deps
-                .unwrap_or_default()
-                .into_iter()
-                .collect(),
+            allowed_deps,
+            allowed_dev_deps,
+            allowed_build_deps,
+            forbidden_deps,
             forbidden_tokens,
         })
     }
@@ -1107,6 +1423,7 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
+    use std::sync::Mutex;
 
     fn fixture_path(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1115,6 +1432,10 @@ mod tests {
     }
 
     fn run_arch_fixture(metadata: &str, config: &Path) -> Output {
+        static FIXTURE_PROCESS_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = FIXTURE_PROCESS_LOCK
+            .lock()
+            .expect("fixture process lock must not be poisoned");
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let workspace_root = manifest_dir
             .parent()

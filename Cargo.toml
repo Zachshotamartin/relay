@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    "crates/relay-core",
+    "crates/relay-wal",
+    "crates/relay-raft",
+    "crates/relay-sim",
+    "crates/relay-model",
+    "crates/relay-wire",
+    "crates/relay-server",
+    "crates/relay-client",
+    "crates/relay-cli",
+    "crates/relay-bench",
+    "tools/arch-check",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+warnings = "deny"
+
+[workspace.lints.clippy]
+pedantic = "deny"
+# Crate names intentionally repeat the product name at package boundaries.
+module_name_repetitions = "allow"
+

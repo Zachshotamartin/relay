@@ -460,6 +460,20 @@ pub fn check_fixture_files(metadata_path: &Path, config_path: &Path) -> Result<(
 /// Returns all deterministic policy violations. Cargo execution and every file
 /// read fail closed.
 pub fn check_workspace_r0_04(root: &Path) -> Result<(), Vec<Violation>> {
+    let mut violations = match check_workspace_arch_and_source(root) {
+        Ok(()) => Vec::new(),
+        Err(violations) => violations,
+    };
+    violations.extend(validate_workspace_r0_06(root));
+    sort_violations(&mut violations);
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations)
+    }
+}
+
+fn check_workspace_arch_and_source(root: &Path) -> Result<(), Vec<Violation>> {
     let config_path = root.join("tools/arch-check/arch.toml");
     let config_source = read_file(&config_path)?;
     let config = parse_arch_config(&config_source)
@@ -529,7 +543,6 @@ pub fn check_workspace_r0_04(root: &Path) -> Result<(), Vec<Violation>> {
         }
     }
     violations.extend(validate_workspace_sources(&config, &metadata));
-    violations.extend(validate_workspace_r0_06(root));
     if violations.is_empty() {
         Ok(())
     } else {
@@ -1064,6 +1077,8 @@ pub fn validate_status_discipline(source: &str) -> Vec<Violation> {
         .any(|line| line.trim() == "# ADR-NNNN: Title");
     let mut violations = Vec::new();
     let mut status = None;
+    let mut current_heading_level = None;
+    let mut status_scope_level = None;
     let mut paragraph = ProseBuffer::default();
     let mut table_status_column = None;
 
@@ -1075,7 +1090,10 @@ pub fn validate_status_discipline(source: &str) -> Vec<Violation> {
             if let Some(value) = explicit_status_value(raw_line) {
                 paragraph.flush(status, &mut violations);
                 match parse_status_word(&value) {
-                    Some(parsed) => status = Some(parsed),
+                    Some(parsed) => {
+                        status = Some(parsed);
+                        status_scope_level = current_heading_level;
+                    }
                     None => violations.push(Violation::new(
                         line_number,
                         format!(
@@ -1123,11 +1141,15 @@ pub fn validate_status_discipline(source: &str) -> Vec<Violation> {
         }
         table_status_column = None;
 
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+        if trimmed.is_empty() {
             paragraph.flush(status, &mut violations);
-            if trimmed.starts_with('#') {
+        } else if let Some(heading_level) = markdown_heading_level(trimmed) {
+            paragraph.flush(status, &mut violations);
+            if status_scope_level.is_some_and(|scope_level| heading_level <= scope_level) {
                 status = None;
+                status_scope_level = None;
             }
+            current_heading_level = Some(heading_level);
         } else {
             paragraph.push(line, line_number);
         }
@@ -1147,9 +1169,14 @@ pub fn check_r0_06_fixture_files(
     gate_registry: &Path,
     docs_root: &Path,
 ) -> Result<(), Vec<Violation>> {
-    let gate_source = read_file(gate_registry)?;
-    let mut violations = qualify_violations(gate_registry, validate_gates(&gate_source));
-    violations.extend(validate_document_tree(docs_root, docs_root.parent(), &[]));
+    let mut violations = validate_document_tree(docs_root, docs_root.parent(), &[]);
+    match read_file(gate_registry) {
+        Ok(gate_source) => violations.extend(qualify_violations(
+            gate_registry,
+            validate_gates(&gate_source),
+        )),
+        Err(gate_violations) => violations.extend(gate_violations),
+    }
     sort_violations(&mut violations);
     if violations.is_empty() {
         Ok(())
@@ -1190,10 +1217,13 @@ fn parse_status_word(value: &str) -> Option<DeliveryStatus> {
 struct GateBuilder {
     line: usize,
     status_seen: bool,
+    status_line: Option<usize>,
     status: Option<DeliveryStatus>,
     section_seen: bool,
+    section_line: Option<usize>,
     section: Option<String>,
     commands_seen: bool,
+    commands_line: Option<usize>,
     commands: Option<Vec<String>>,
 }
 
@@ -1202,10 +1232,13 @@ impl GateBuilder {
         Self {
             line,
             status_seen: false,
+            status_line: None,
             status: None,
             section_seen: false,
+            section_line: None,
             section: None,
             commands_seen: false,
+            commands_line: None,
             commands: None,
         }
     }
@@ -1217,6 +1250,7 @@ impl GateBuilder {
                     violations.push(Violation::new(line, "duplicate gate registry field status"));
                     return;
                 }
+                self.status_line = Some(line);
                 match parse_toml_string(value) {
                     Ok(value) => match parse_status_word(&value) {
                         Some(status) => self.status = Some(status),
@@ -1241,6 +1275,7 @@ impl GateBuilder {
                     ));
                     return;
                 }
+                self.section_line = Some(line);
                 match parse_toml_string(value) {
                     Ok(value) if value.trim().is_empty() => {
                         violations.push(Violation::new(line, "gate section must not be empty"));
@@ -1260,11 +1295,22 @@ impl GateBuilder {
                     ));
                     return;
                 }
+                self.commands_line = Some(line);
                 match parse_string_array(value) {
                     Ok(commands) if commands.iter().any(|command| command.trim().is_empty()) => {
                         violations.push(Violation::new(
                             line,
                             "gate command strings must not be empty",
+                        ));
+                    }
+                    Ok(commands)
+                        if commands
+                            .iter()
+                            .any(|command| command.contains(['\n', '\r'])) =>
+                    {
+                        violations.push(Violation::new(
+                            line,
+                            "gate command strings must not contain newlines",
                         ));
                     }
                     Ok(commands) => self.commands = Some(commands),
@@ -1304,7 +1350,7 @@ impl GateBuilder {
             let expected = format!("BUILD_PLAN.md §{section_number}");
             if section != expected {
                 violations.push(Violation::new(
-                    self.line,
+                    self.section_line.unwrap_or(self.line),
                     format!("gate {gate_name} section must be {expected:?}, found {section:?}"),
                 ));
             }
@@ -1313,7 +1359,7 @@ impl GateBuilder {
             && self.commands.as_ref().is_none_or(Vec::is_empty)
         {
             violations.push(Violation::new(
-                self.line,
+                self.commands_line.unwrap_or(self.line),
                 format!("accepted gate {gate_name} must have commands"),
             ));
         }
@@ -1337,6 +1383,8 @@ fn finish_gate_registry(
             "gate registry is missing required schema = 1",
         ));
     }
+    validate_gate_replay_order(&gates, violations);
+    validate_accepted_gate_prefix(&gates, violations);
     for number in 0..=10 {
         let gate_name = format!("R{number}");
         match gates.remove(&gate_name) {
@@ -1345,6 +1393,50 @@ fn finish_gate_registry(
                 1,
                 format!("gate registry is missing required section {gate_name}"),
             )),
+        }
+    }
+}
+
+fn validate_gate_replay_order(
+    gates: &BTreeMap<String, GateBuilder>,
+    violations: &mut Vec<Violation>,
+) {
+    let mut encountered: Vec<_> = gates.iter().collect();
+    encountered.sort_by_key(|(_, builder)| builder.line);
+    for (number, (gate_name, builder)) in encountered.into_iter().enumerate() {
+        let expected = format!("R{number}");
+        if gate_name != &expected {
+            violations.push(Violation::new(
+                builder.line,
+                format!(
+                    "gate sections are out of replay order: expected {expected}, found {gate_name}"
+                ),
+            ));
+        }
+    }
+}
+
+fn validate_accepted_gate_prefix(
+    gates: &BTreeMap<String, GateBuilder>,
+    violations: &mut Vec<Violation>,
+) {
+    let mut first_unaccepted = None;
+    for number in 0..=10 {
+        let gate_name = format!("R{number}");
+        let Some(builder) = gates.get(&gate_name) else {
+            continue;
+        };
+        if builder.status == Some(DeliveryStatus::Accepted) {
+            if let Some(ref earlier_gate) = first_unaccepted {
+                violations.push(Violation::new(
+                    builder.status_line.unwrap_or(builder.line),
+                    format!(
+                        "accepted gate {gate_name} is not a prefix because earlier gate {earlier_gate} is unaccepted"
+                    ),
+                ));
+            }
+        } else if first_unaccepted.is_none() {
+            first_unaccepted = Some(gate_name);
         }
     }
 }
@@ -1397,13 +1489,33 @@ fn markdown_links(source: &str) -> (Vec<MarkdownLink>, Vec<Violation>) {
     let cleaned = clean_markdown_prose(source);
     let mut links = Vec::new();
     let mut violations = Vec::new();
+    let mut definitions: BTreeMap<String, MarkdownLink> = BTreeMap::new();
+    let mut references = Vec::new();
 
     for (line_index, line) in cleaned.lines().enumerate() {
         let line_number = line_index + 1;
+        if let Some((label, target)) = reference_definition(line) {
+            let definition = MarkdownLink {
+                line: line_number,
+                target,
+            };
+            if definitions.insert(label.clone(), definition).is_some() {
+                violations.push(Violation::new(
+                    line_number,
+                    format!("duplicate Markdown reference definition [{label}]"),
+                ));
+            }
+        }
+        references.extend(full_reference_uses(line, line_number));
+
         let bytes = line.as_bytes();
         let mut index = 0;
         while index + 1 < bytes.len() {
-            if bytes[index] == b']' && bytes[index + 1] == b'(' && !is_escaped(bytes, index) {
+            if bytes[index] == b']'
+                && bytes[index + 1] == b'('
+                && !is_escaped(bytes, index)
+                && inline_link_label_start(bytes, index).is_some()
+            {
                 let destination_start = index + 2;
                 let mut cursor = destination_start;
                 let mut depth = 1_u32;
@@ -1449,25 +1561,108 @@ fn markdown_links(source: &str) -> (Vec<MarkdownLink>, Vec<Violation>) {
                 index += 1;
             }
         }
-
-        let trimmed = line.trim_start();
-        if let Some(label_end) = trimmed.find("]:") {
-            if trimmed.starts_with('[') {
-                let destination = &trimmed[label_end + 2..];
-                match markdown_destination(destination) {
-                    Some(target) => links.push(MarkdownLink {
-                        line: line_number,
-                        target,
-                    }),
-                    None => violations.push(Violation::new(
-                        line_number,
-                        "Markdown reference link destination must not be empty or malformed",
-                    )),
-                }
-            }
+    }
+    let mut used_definitions = BTreeSet::new();
+    for (_, label) in references {
+        if definitions.contains_key(&label) {
+            used_definitions.insert(label);
+        }
+    }
+    for label in used_definitions {
+        if let Some(definition) = definitions.remove(&label) {
+            links.push(definition);
         }
     }
     (links, violations)
+}
+
+fn inline_link_label_start(bytes: &[u8], close: usize) -> Option<usize> {
+    let start = bytes[..close].iter().rposition(|byte| *byte == b'[')?;
+    if is_escaped(bytes, start) || bytes.get(start + 1) == Some(&b'^') {
+        None
+    } else {
+        Some(start)
+    }
+}
+
+fn reference_definition(line: &str) -> Option<(String, String)> {
+    let line = strip_blockquote_prefix(line);
+    let bytes = line.as_bytes();
+    if bytes.first() != Some(&b'[') || bytes.get(1) == Some(&b'^') {
+        return None;
+    }
+    let label_end =
+        bytes.iter().enumerate().skip(1).find_map(|(index, byte)| {
+            (*byte == b']' && !is_escaped(bytes, index)).then_some(index)
+        })?;
+    if bytes.get(label_end + 1) != Some(&b':') {
+        return None;
+    }
+    let label = normalize_reference_label(&line[1..label_end]);
+    if label.is_empty() {
+        return None;
+    }
+    markdown_destination(&line[label_end + 2..]).map(|target| (label, target))
+}
+
+fn strip_blockquote_prefix(mut line: &str) -> &str {
+    line = line.trim_start();
+    while let Some(remainder) = line.strip_prefix('>') {
+        line = remainder
+            .strip_prefix(' ')
+            .unwrap_or(remainder)
+            .trim_start();
+    }
+    line
+}
+
+fn full_reference_uses(line: &str, line_number: usize) -> Vec<(usize, String)> {
+    let bytes = line.as_bytes();
+    let mut references = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'[' || is_escaped(bytes, index) || bytes.get(index + 1) == Some(&b'^') {
+            index += 1;
+            continue;
+        }
+        let Some(first_end) = find_unescaped_byte(bytes, index + 1, b']') else {
+            break;
+        };
+        if bytes.get(first_end + 1) != Some(&b'[') {
+            index = first_end + 1;
+            continue;
+        }
+        let Some(second_end) = find_unescaped_byte(bytes, first_end + 2, b']') else {
+            break;
+        };
+        let explicit = &line[first_end + 2..second_end];
+        let label = if explicit.is_empty() {
+            normalize_reference_label(&line[index + 1..first_end])
+        } else {
+            normalize_reference_label(explicit)
+        };
+        if !label.is_empty() {
+            references.push((line_number, label));
+        }
+        index = second_end + 1;
+    }
+    references
+}
+
+fn find_unescaped_byte(bytes: &[u8], start: usize, expected: u8) -> Option<usize> {
+    bytes
+        .iter()
+        .enumerate()
+        .skip(start)
+        .find_map(|(index, byte)| (*byte == expected && !is_escaped(bytes, index)).then_some(index))
+}
+
+fn normalize_reference_label(label: &str) -> String {
+    label
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 fn markdown_destination(value: &str) -> Option<String> {
@@ -1634,9 +1829,13 @@ fn clean_markdown_prose(source: &str) -> String {
                 } else if bytes[index] == b'`' {
                     let run = repeated_byte(bytes, index, line_end, b'`');
                     let close = find_byte_run(bytes, index + run, line_end, b'`', run);
-                    let end = close.map_or(line_end, |close| close + run);
-                    mask_markdown_range(&mut cleaned, index, end);
-                    index = end;
+                    if let Some(close) = close {
+                        let end = close + run;
+                        mask_markdown_range(&mut cleaned, index, end);
+                        index = end;
+                    } else {
+                        index += run;
+                    }
                 } else {
                     index += 1;
                 }
@@ -1707,8 +1906,19 @@ fn explicit_status_value(line: &str) -> Option<String> {
             .trim_matches(|character: char| {
                 character.is_whitespace() || matches!(character, '*' | '`')
             })
-            .to_ascii_lowercase(),
+            .to_owned(),
     )
+}
+
+fn markdown_heading_level(line: &str) -> Option<usize> {
+    let level = line.bytes().take_while(|byte| *byte == b'#').count();
+    (level > 0
+        && level <= 6
+        && line
+            .as_bytes()
+            .get(level)
+            .is_some_and(u8::is_ascii_whitespace))
+    .then_some(level)
 }
 
 fn markdown_table_cells(line: &str) -> Vec<String> {
@@ -1724,7 +1934,7 @@ fn strip_markdown_status(value: &str) -> String {
         .trim_matches(|character: char| {
             character.is_whitespace() || matches!(character, '*' | '`' | '.')
         })
-        .to_ascii_lowercase()
+        .to_owned()
 }
 
 fn is_markdown_table_separator(value: &str) -> bool {
@@ -1813,20 +2023,44 @@ fn unearned_claims(unit: &str, status: Option<DeliveryStatus>) -> Vec<(usize, &'
         return Vec::new();
     }
     let mut claims = Vec::new();
-    for (pattern, verb) in [
-        ("relay supports", "supports"),
-        ("relay guarantees", "guarantees"),
-        ("relay provides", "provides"),
-    ] {
-        for (offset, _) in lower.match_indices(pattern) {
-            let end = offset + pattern.len();
-            if ascii_word_boundary(&lower, offset, end) && !inside_quotation(unit, offset) {
+    for verb in ["supports", "guarantees", "provides"] {
+        for (offset, _) in lower.match_indices(verb) {
+            let end = offset + verb.len();
+            if ascii_word_boundary(&lower, offset, end)
+                && direct_claim_subject_before(&lower, offset)
+                && !inside_quotation(unit, offset)
+            {
                 claims.push((offset, verb));
             }
         }
     }
     claims.sort_by_key(|claim| claim.0);
     claims
+}
+
+fn direct_claim_subject_before(value: &str, verb_offset: usize) -> bool {
+    let mut words = value[..verb_offset]
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .filter(|word| !word.is_empty())
+        .rev();
+    let mut word = words.next();
+    while word.is_some_and(|word| {
+        matches!(
+            word,
+            "currently"
+                | "now"
+                | "already"
+                | "also"
+                | "directly"
+                | "explicitly"
+                | "fully"
+                | "reliably"
+                | "itself"
+        )
+    }) {
+        word = words.next();
+    }
+    word.is_some_and(|word| matches!(word, "relay" | "service" | "product" | "system" | "server"))
 }
 
 fn contains_ascii_word(value: &str, word: &str) -> bool {
@@ -3271,6 +3505,9 @@ fn parse_toml_string(value: &str) -> Result<String, String> {
         return Err("expected one complete quoted string".to_owned());
     }
     let inner = &value[1..value.len() - 1];
+    if inner.contains(['\n', '\r']) {
+        return Err("single-line TOML strings must not contain raw newlines".to_owned());
+    }
     if quote == b'\'' {
         return Ok(inner.to_owned());
     }

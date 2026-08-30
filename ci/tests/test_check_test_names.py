@@ -252,6 +252,18 @@ async fn bad_name() {}
         self.assertEqual(["bad_name"], [item.name for item in violations])
         self.assertEqual([4], [item.line for item in violations])
 
+    def test_r0_name_15_ignores_definitive_non_test_function_attributes(self) -> None:
+        source = """#[allow(dead_code)]
+#[inline]
+fn helper_is_not_a_test() {}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tests" / "helper.rs"
+            path.parent.mkdir()
+            path.write_text(source, encoding="utf-8")
+
+            self.assertEqual([], check_test_names.find_violations(Path(directory)))
+
 
 if __name__ == "__main__":
     unittest.main()

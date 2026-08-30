@@ -523,6 +523,7 @@ pub fn check_workspace_r0_04(root: &Path) -> Result<(), Vec<Violation>> {
         }
     }
     violations.extend(validate_workspace_sources(&config, &metadata));
+    violations.extend(validate_workspace_r0_06(root));
     if violations.is_empty() {
         Ok(())
     } else {
@@ -581,18 +582,203 @@ pub fn check_source_fixture_files(
 }
 
 #[must_use]
-pub fn validate_gates(_source: &str) -> Vec<Violation> {
-    Vec::new()
+pub fn validate_gates(source: &str) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    let mut schema = None;
+    let mut gates: BTreeMap<String, GateBuilder> = BTreeMap::new();
+    let mut current_gate = None;
+    let mut entered_table = false;
+    let lines: Vec<&str> = source.lines().collect();
+    let mut index = 0;
+
+    while index < lines.len() {
+        let line_number = index + 1;
+        let uncommented = strip_toml_comment(lines[index]);
+        let line = uncommented.trim();
+        if line.is_empty() {
+            index += 1;
+            continue;
+        }
+
+        if line.starts_with('[') {
+            entered_table = true;
+            current_gate = start_gate_table(line, line_number, &mut gates, &mut violations);
+            index += 1;
+            continue;
+        }
+
+        let Some((key, mut value)) = split_assignment(line) else {
+            violations.push(Violation::new(
+                line_number,
+                "malformed gate registry assignment",
+            ));
+            index += 1;
+            continue;
+        };
+        let key = key.trim();
+        let mut end = index;
+        while delimiters_unbalanced(&value) && end + 1 < lines.len() {
+            end += 1;
+            value.push('\n');
+            value.push_str(strip_toml_comment(lines[end]).trim());
+        }
+        if delimiters_unbalanced(&value) {
+            violations.push(Violation::new(
+                line_number,
+                format!("unterminated gate registry value for {key}"),
+            ));
+            index = end + 1;
+            continue;
+        }
+
+        if current_gate.is_none() {
+            if key != "schema" {
+                violations.push(Violation::new(
+                    line_number,
+                    format!("gate registry field {key} is outside a gate section"),
+                ));
+            } else if entered_table {
+                violations.push(Violation::new(
+                    line_number,
+                    "gate registry schema must precede every gate section",
+                ));
+            } else if schema.is_some() {
+                violations.push(Violation::new(
+                    line_number,
+                    "duplicate gate registry schema field",
+                ));
+            } else if value.trim() == "1" {
+                schema = Some(line_number);
+            } else {
+                violations.push(Violation::new(
+                    line_number,
+                    format!(
+                        "unsupported or malformed gate registry schema {:?}; expected 1",
+                        value.trim()
+                    ),
+                ));
+                schema = Some(line_number);
+            }
+        } else if key == "schema" {
+            violations.push(Violation::new(
+                line_number,
+                "gate registry schema must be a single top-level field",
+            ));
+        } else if let Some(builder) = current_gate
+            .as_ref()
+            .and_then(|gate_name| gates.get_mut(gate_name))
+        {
+            builder.set(key, value.trim(), line_number, &mut violations);
+        }
+        index = end + 1;
+    }
+
+    finish_gate_registry(schema, gates, &mut violations);
+    violations
 }
 
 #[must_use]
-pub fn validate_relative_links(_source: &str, _known_paths: &[String]) -> Vec<Violation> {
-    Vec::new()
+pub fn validate_relative_links(source: &str, known_paths: &[String]) -> Vec<Violation> {
+    let known_paths: BTreeSet<String> = known_paths
+        .iter()
+        .filter_map(|path| normalize_relative_target(path).ok())
+        .collect();
+    let (links, mut violations) = markdown_links(source);
+    for link in links {
+        let Some(target) = relative_link_path(&link.target) else {
+            continue;
+        };
+        match normalize_relative_target(target) {
+            Ok(normalized) if known_paths.contains(&normalized) => {}
+            Ok(normalized) => violations.push(Violation::new(
+                link.line,
+                format!("relative documentation link {normalized:?} does not resolve"),
+            )),
+            Err(message) => violations.push(Violation::new(link.line, message)),
+        }
+    }
+    violations
 }
 
 #[must_use]
-pub fn validate_status_discipline(_source: &str) -> Vec<Violation> {
-    Vec::new()
+pub fn validate_status_discipline(source: &str) -> Vec<Violation> {
+    let cleaned = clean_markdown_prose(source);
+    let is_adr_template = source
+        .lines()
+        .take(5)
+        .any(|line| line.trim() == "# ADR-NNNN: Title");
+    let mut violations = Vec::new();
+    let mut status = None;
+    let mut paragraph = ProseBuffer::default();
+    let mut table_status_column = None;
+
+    let raw_lines: Vec<&str> = source.lines().collect();
+    for (line_index, line) in cleaned.lines().enumerate() {
+        let line_number = line_index + 1;
+        let raw_line = raw_lines.get(line_index).copied().unwrap_or(line);
+        if !is_adr_template && !line.trim().is_empty() {
+            if let Some(value) = explicit_status_value(raw_line) {
+                paragraph.flush(status, &mut violations);
+                match parse_status_word(&value) {
+                    Some(parsed) => status = Some(parsed),
+                    None => violations.push(Violation::new(
+                        line_number,
+                        format!(
+                            "status {value:?} is invalid; expected accepted, in progress, planned, or deferred"
+                        ),
+                    )),
+                }
+                continue;
+            }
+        }
+
+        let trimmed = line.trim();
+        if trimmed.starts_with('|') && trimmed.ends_with('|') {
+            paragraph.flush(status, &mut violations);
+            let cells = markdown_table_cells(raw_line.trim());
+            if let Some(column) = cells
+                .iter()
+                .position(|cell| cell.eq_ignore_ascii_case("status"))
+            {
+                table_status_column = Some(column);
+                continue;
+            }
+            if cells.iter().all(|cell| is_markdown_table_separator(cell)) {
+                continue;
+            }
+            let mut row_status = status;
+            if let Some(column) = table_status_column {
+                if let Some(value) = cells.get(column) {
+                    let value = strip_markdown_status(value);
+                    if !value.is_empty() {
+                        match parse_status_word(&value) {
+                            Some(parsed) => row_status = Some(parsed),
+                            None => violations.push(Violation::new(
+                                line_number,
+                                format!(
+                                    "status {value:?} is invalid; expected accepted, in progress, planned, or deferred"
+                                ),
+                            )),
+                        }
+                    }
+                }
+            }
+            check_claim_unit(trimmed, line_number, row_status, &mut violations);
+            continue;
+        }
+        table_status_column = None;
+
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            paragraph.flush(status, &mut violations);
+            if trimmed.starts_with('#') {
+                status = None;
+            }
+        } else {
+            paragraph.push(line, line_number);
+        }
+    }
+    paragraph.flush(status, &mut violations);
+    violations
 }
 
 /// Runs only the R0.06 gate-registry and documentation checks against fixture
@@ -603,10 +789,18 @@ pub fn validate_status_discipline(_source: &str) -> Vec<Violation> {
 /// Returns deterministic, file-qualified diagnostics for every malformed or
 /// unreadable required input, unearned claim, and dangling relative link.
 pub fn check_r0_06_fixture_files(
-    _gate_registry: &Path,
-    _docs_root: &Path,
+    gate_registry: &Path,
+    docs_root: &Path,
 ) -> Result<(), Vec<Violation>> {
-    Ok(())
+    let gate_source = read_file(gate_registry)?;
+    let mut violations = qualify_violations(gate_registry, validate_gates(&gate_source));
+    violations.extend(validate_document_tree(docs_root, docs_root.parent(), &[]));
+    sort_violations(&mut violations);
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations)
+    }
 }
 
 #[must_use]
@@ -617,6 +811,1051 @@ pub fn validate_test_names(_source: &str) -> Vec<Violation> {
 #[must_use]
 pub fn scan_canaries(_source: &str) -> Vec<Violation> {
     Vec::new()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeliveryStatus {
+    Accepted,
+    InProgress,
+    Planned,
+    Deferred,
+}
+
+fn parse_status_word(value: &str) -> Option<DeliveryStatus> {
+    match value {
+        "accepted" => Some(DeliveryStatus::Accepted),
+        "in progress" => Some(DeliveryStatus::InProgress),
+        "planned" => Some(DeliveryStatus::Planned),
+        "deferred" => Some(DeliveryStatus::Deferred),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GateBuilder {
+    line: usize,
+    status_seen: bool,
+    status: Option<DeliveryStatus>,
+    section_seen: bool,
+    section: Option<String>,
+    commands_seen: bool,
+    commands: Option<Vec<String>>,
+}
+
+impl GateBuilder {
+    fn new(line: usize) -> Self {
+        Self {
+            line,
+            status_seen: false,
+            status: None,
+            section_seen: false,
+            section: None,
+            commands_seen: false,
+            commands: None,
+        }
+    }
+
+    fn set(&mut self, key: &str, value: &str, line: usize, violations: &mut Vec<Violation>) {
+        match key {
+            "status" => {
+                if std::mem::replace(&mut self.status_seen, true) {
+                    violations.push(Violation::new(line, "duplicate gate registry field status"));
+                    return;
+                }
+                match parse_toml_string(value) {
+                    Ok(value) => match parse_status_word(&value) {
+                        Some(status) => self.status = Some(status),
+                        None => violations.push(Violation::new(
+                            line,
+                            format!(
+                                "gate status {value:?} is invalid; expected accepted, in progress, planned, or deferred"
+                            ),
+                        )),
+                    },
+                    Err(message) => violations.push(Violation::new(
+                        line,
+                        format!("gate status must be a string: {message}"),
+                    )),
+                }
+            }
+            "section" => {
+                if std::mem::replace(&mut self.section_seen, true) {
+                    violations.push(Violation::new(
+                        line,
+                        "duplicate gate registry field section",
+                    ));
+                    return;
+                }
+                match parse_toml_string(value) {
+                    Ok(value) if value.trim().is_empty() => {
+                        violations.push(Violation::new(line, "gate section must not be empty"));
+                    }
+                    Ok(value) => self.section = Some(value),
+                    Err(message) => violations.push(Violation::new(
+                        line,
+                        format!("gate section must be a string: {message}"),
+                    )),
+                }
+            }
+            "commands" => {
+                if std::mem::replace(&mut self.commands_seen, true) {
+                    violations.push(Violation::new(
+                        line,
+                        "duplicate gate registry field commands",
+                    ));
+                    return;
+                }
+                match parse_string_array(value) {
+                    Ok(commands) if commands.iter().any(|command| command.trim().is_empty()) => {
+                        violations.push(Violation::new(
+                            line,
+                            "gate command strings must not be empty",
+                        ));
+                    }
+                    Ok(commands) => self.commands = Some(commands),
+                    Err(message) => violations.push(Violation::new(
+                        line,
+                        format!("malformed gate commands: {message}"),
+                    )),
+                }
+            }
+            _ => violations.push(Violation::new(
+                line,
+                format!("unknown gate registry field {key}"),
+            )),
+        }
+    }
+
+    fn finish(self, gate_name: &str, section_number: usize, violations: &mut Vec<Violation>) {
+        if !self.status_seen {
+            violations.push(Violation::new(
+                self.line,
+                format!("gate {gate_name} is missing status"),
+            ));
+        }
+        if !self.section_seen {
+            violations.push(Violation::new(
+                self.line,
+                format!("gate {gate_name} is missing section"),
+            ));
+        }
+        if !self.commands_seen {
+            violations.push(Violation::new(
+                self.line,
+                format!("gate {gate_name} is missing commands"),
+            ));
+        }
+        if let Some(section) = self.section {
+            let expected = format!("BUILD_PLAN.md §{section_number}");
+            if section != expected {
+                violations.push(Violation::new(
+                    self.line,
+                    format!("gate {gate_name} section must be {expected:?}, found {section:?}"),
+                ));
+            }
+        }
+        if self.status == Some(DeliveryStatus::Accepted)
+            && self.commands.as_ref().is_none_or(Vec::is_empty)
+        {
+            violations.push(Violation::new(
+                self.line,
+                format!("accepted gate {gate_name} must have commands"),
+            ));
+        }
+    }
+}
+
+fn is_expected_gate(name: &str) -> bool {
+    name.strip_prefix('R')
+        .and_then(|number| number.parse::<usize>().ok())
+        .is_some_and(|number| number <= 10 && name == format!("R{number}"))
+}
+
+fn finish_gate_registry(
+    schema: Option<usize>,
+    mut gates: BTreeMap<String, GateBuilder>,
+    violations: &mut Vec<Violation>,
+) {
+    if schema.is_none() {
+        violations.push(Violation::new(
+            1,
+            "gate registry is missing required schema = 1",
+        ));
+    }
+    for number in 0..=10 {
+        let gate_name = format!("R{number}");
+        match gates.remove(&gate_name) {
+            Some(builder) => builder.finish(&gate_name, number + 5, violations),
+            None => violations.push(Violation::new(
+                1,
+                format!("gate registry is missing required section {gate_name}"),
+            )),
+        }
+    }
+}
+
+fn start_gate_table(
+    line: &str,
+    line_number: usize,
+    gates: &mut BTreeMap<String, GateBuilder>,
+    violations: &mut Vec<Violation>,
+) -> Option<String> {
+    let Some(table) = parse_table_header(line) else {
+        violations.push(Violation::new(
+            line_number,
+            "malformed gate registry table header",
+        ));
+        return None;
+    };
+    let Some(gate_name) = table.strip_prefix("gate.") else {
+        violations.push(Violation::new(
+            line_number,
+            format!("unknown gate registry table [{table}]"),
+        ));
+        return None;
+    };
+    if !is_expected_gate(gate_name) {
+        violations.push(Violation::new(
+            line_number,
+            format!("unknown gate registry section {gate_name}"),
+        ));
+        return None;
+    }
+    if gates.contains_key(gate_name) {
+        violations.push(Violation::new(
+            line_number,
+            format!("duplicate gate registry section {gate_name}"),
+        ));
+        return None;
+    }
+    gates.insert(gate_name.to_owned(), GateBuilder::new(line_number));
+    Some(gate_name.to_owned())
+}
+
+#[derive(Clone, Debug)]
+struct MarkdownLink {
+    line: usize,
+    target: String,
+}
+
+fn markdown_links(source: &str) -> (Vec<MarkdownLink>, Vec<Violation>) {
+    let cleaned = clean_markdown_prose(source);
+    let mut links = Vec::new();
+    let mut violations = Vec::new();
+
+    for (line_index, line) in cleaned.lines().enumerate() {
+        let line_number = line_index + 1;
+        let bytes = line.as_bytes();
+        let mut index = 0;
+        while index + 1 < bytes.len() {
+            if bytes[index] == b']' && bytes[index + 1] == b'(' && !is_escaped(bytes, index) {
+                let destination_start = index + 2;
+                let mut cursor = destination_start;
+                let mut depth = 1_u32;
+                let mut angle = false;
+                while cursor < bytes.len() {
+                    if bytes[cursor] == b'\\' {
+                        cursor = (cursor + 2).min(bytes.len());
+                        continue;
+                    }
+                    match bytes[cursor] {
+                        b'<' if depth == 1 => angle = true,
+                        b'>' if depth == 1 => angle = false,
+                        b'(' if !angle => depth += 1,
+                        b')' if !angle => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    cursor += 1;
+                }
+                if cursor == bytes.len() {
+                    violations.push(Violation::new(
+                        line_number,
+                        "malformed Markdown link has no closing parenthesis",
+                    ));
+                    break;
+                }
+                match markdown_destination(&line[destination_start..cursor]) {
+                    Some(target) => links.push(MarkdownLink {
+                        line: line_number,
+                        target,
+                    }),
+                    None => violations.push(Violation::new(
+                        line_number,
+                        "Markdown link destination must not be empty or malformed",
+                    )),
+                }
+                index = cursor + 1;
+            } else {
+                index += 1;
+            }
+        }
+
+        let trimmed = line.trim_start();
+        if let Some(label_end) = trimmed.find("]:") {
+            if trimmed.starts_with('[') {
+                let destination = &trimmed[label_end + 2..];
+                match markdown_destination(destination) {
+                    Some(target) => links.push(MarkdownLink {
+                        line: line_number,
+                        target,
+                    }),
+                    None => violations.push(Violation::new(
+                        line_number,
+                        "Markdown reference link destination must not be empty or malformed",
+                    )),
+                }
+            }
+        }
+    }
+    (links, violations)
+}
+
+fn markdown_destination(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Some(value) = value.strip_prefix('<') {
+        let end = value.find('>')?;
+        let target = value[..end].trim();
+        return (!target.is_empty()).then(|| target.to_owned());
+    }
+    let mut escaped = false;
+    let mut depth = 0_u32;
+    let end = value
+        .char_indices()
+        .find_map(|(index, character)| {
+            if escaped {
+                escaped = false;
+                return None;
+            }
+            if character == '\\' {
+                escaped = true;
+            } else if character == '(' {
+                depth += 1;
+            } else if character == ')' && depth > 0 {
+                depth -= 1;
+            } else if character.is_whitespace() && depth == 0 {
+                return Some(index);
+            }
+            None
+        })
+        .unwrap_or(value.len());
+    let target = value[..end].trim();
+    (!target.is_empty()).then(|| target.replace("\\(", "(").replace("\\)", ")"))
+}
+
+fn is_escaped(bytes: &[u8], index: usize) -> bool {
+    let mut backslashes = 0;
+    let mut cursor = index;
+    while cursor > 0 && bytes[cursor - 1] == b'\\' {
+        backslashes += 1;
+        cursor -= 1;
+    }
+    backslashes % 2 == 1
+}
+
+fn relative_link_path(target: &str) -> Option<&str> {
+    let target = target.trim();
+    if target.is_empty()
+        || target.starts_with('#')
+        || target.starts_with('/')
+        || target.starts_with("//")
+    {
+        return None;
+    }
+    let end = [target.find('#'), target.find('?')]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(target.len());
+    let target = target[..end].trim();
+    if target.is_empty() || has_uri_scheme(target) {
+        None
+    } else {
+        Some(target)
+    }
+}
+
+fn has_uri_scheme(target: &str) -> bool {
+    let Some(colon) = target.find(':') else {
+        return false;
+    };
+    let scheme = &target[..colon];
+    !scheme.is_empty()
+        && scheme.as_bytes()[0].is_ascii_alphabetic()
+        && scheme
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+}
+
+fn normalize_relative_target(target: &str) -> Result<String, String> {
+    if target.contains('\\') {
+        return Err(format!(
+            "relative documentation link {target:?} contains a non-portable backslash"
+        ));
+    }
+    let mut components = Vec::new();
+    for component in Path::new(target).components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(component) => {
+                let component = component.to_str().ok_or_else(|| {
+                    format!("relative documentation link {target:?} is not valid UTF-8")
+                })?;
+                components.push(component.to_owned());
+            }
+            std::path::Component::ParentDir => {
+                if components.pop().is_none() {
+                    return Err(format!(
+                        "relative documentation link {target:?} escapes its allowed root"
+                    ));
+                }
+            }
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                return Err(format!(
+                    "relative documentation link {target:?} must not be absolute"
+                ));
+            }
+        }
+    }
+    Ok(if components.is_empty() {
+        ".".to_owned()
+    } else {
+        components.join("/")
+    })
+}
+
+fn clean_markdown_prose(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut cleaned = bytes.to_vec();
+    let mut in_fence: Option<(u8, usize)> = None;
+    let mut in_comment = false;
+    let mut line_start = 0;
+
+    while line_start < bytes.len() {
+        let line_end = bytes[line_start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(bytes.len(), |offset| line_start + offset);
+        let mut content_start = line_start;
+        while content_start < line_end && bytes[content_start] == b' ' {
+            content_start += 1;
+        }
+        let fence = fence_marker(&bytes[content_start..line_end]);
+        if let Some((marker, length)) = in_fence {
+            mask_markdown_range(&mut cleaned, line_start, line_end);
+            if fence.is_some_and(|candidate| candidate.0 == marker && candidate.1 >= length) {
+                in_fence = None;
+            }
+        } else if let Some(marker) = fence {
+            mask_markdown_range(&mut cleaned, line_start, line_end);
+            in_fence = Some(marker);
+        } else if content_start.saturating_sub(line_start) >= 4
+            || bytes.get(line_start) == Some(&b'\t')
+        {
+            mask_markdown_range(&mut cleaned, line_start, line_end);
+        } else {
+            let mut index = line_start;
+            while index < line_end {
+                if in_comment {
+                    if bytes.get(index..index + 3) == Some(b"-->") {
+                        mask_markdown_range(&mut cleaned, index, index + 3);
+                        in_comment = false;
+                        index += 3;
+                    } else {
+                        cleaned[index] = b' ';
+                        index += 1;
+                    }
+                } else if bytes.get(index..index + 4) == Some(b"<!--") {
+                    mask_markdown_range(&mut cleaned, index, index + 4);
+                    in_comment = true;
+                    index += 4;
+                } else if bytes[index] == b'`' {
+                    let run = repeated_byte(bytes, index, line_end, b'`');
+                    let close = find_byte_run(bytes, index + run, line_end, b'`', run);
+                    let end = close.map_or(line_end, |close| close + run);
+                    mask_markdown_range(&mut cleaned, index, end);
+                    index = end;
+                } else {
+                    index += 1;
+                }
+            }
+        }
+        line_start = (line_end + 1).min(bytes.len());
+    }
+    String::from_utf8(cleaned).unwrap_or_else(|_| source.to_owned())
+}
+
+fn fence_marker(line: &[u8]) -> Option<(u8, usize)> {
+    let marker = *line.first()?;
+    if !matches!(marker, b'`' | b'~') {
+        return None;
+    }
+    let length = repeated_byte(line, 0, line.len(), marker);
+    (length >= 3).then_some((marker, length))
+}
+
+fn repeated_byte(bytes: &[u8], start: usize, end: usize, byte: u8) -> usize {
+    let mut cursor = start;
+    while cursor < end && bytes[cursor] == byte {
+        cursor += 1;
+    }
+    cursor - start
+}
+
+fn find_byte_run(bytes: &[u8], start: usize, end: usize, byte: u8, length: usize) -> Option<usize> {
+    let mut cursor = start;
+    while cursor + length <= end {
+        if repeated_byte(bytes, cursor, end, byte) >= length {
+            return Some(cursor);
+        }
+        cursor += 1;
+    }
+    None
+}
+
+fn mask_markdown_range(cleaned: &mut [u8], start: usize, end: usize) {
+    for byte in &mut cleaned[start..end] {
+        if *byte != b'\n' {
+            *byte = b' ';
+        }
+    }
+}
+
+fn explicit_status_value(line: &str) -> Option<String> {
+    let mut line = line.trim();
+    if let Some(rest) = line.strip_prefix("- ") {
+        line = rest.trim_start();
+    }
+    let value = if line
+        .get(.."**Status:**".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("**Status:**"))
+    {
+        &line["**Status:**".len()..]
+    } else if line
+        .get(.."Status:".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Status:"))
+    {
+        &line["Status:".len()..]
+    } else {
+        return None;
+    };
+    let value = value.split(['.', ';']).next().unwrap_or(value).trim();
+    Some(
+        value
+            .trim_matches(|character: char| {
+                character.is_whitespace() || matches!(character, '*' | '`')
+            })
+            .to_ascii_lowercase(),
+    )
+}
+
+fn markdown_table_cells(line: &str) -> Vec<String> {
+    line.trim_matches('|')
+        .split('|')
+        .map(|cell| strip_markdown_status(cell.trim()))
+        .collect()
+}
+
+fn strip_markdown_status(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches(|character: char| {
+            character.is_whitespace() || matches!(character, '*' | '`' | '.')
+        })
+        .to_ascii_lowercase()
+}
+
+fn is_markdown_table_separator(value: &str) -> bool {
+    let value = value.trim_matches(':');
+    value.len() >= 3 && value.bytes().all(|byte| byte == b'-')
+}
+
+#[derive(Default)]
+struct ProseBuffer {
+    text: String,
+    line_by_byte: Vec<usize>,
+}
+
+impl ProseBuffer {
+    fn push(&mut self, line: &str, line_number: usize) {
+        if !self.text.is_empty() {
+            self.text.push(' ');
+            self.line_by_byte.push(line_number);
+        }
+        self.text.push_str(line.trim());
+        self.line_by_byte
+            .extend(std::iter::repeat_n(line_number, line.trim().len()));
+    }
+
+    fn flush(&mut self, status: Option<DeliveryStatus>, violations: &mut Vec<Violation>) {
+        if self.text.is_empty() {
+            return;
+        }
+        let mut start = 0;
+        for (index, character) in self.text.char_indices() {
+            if matches!(character, '.' | '!' | '?') {
+                self.check_range(start, index + character.len_utf8(), status, violations);
+                start = index + character.len_utf8();
+            }
+        }
+        if start < self.text.len() {
+            self.check_range(start, self.text.len(), status, violations);
+        }
+        self.text.clear();
+        self.line_by_byte.clear();
+    }
+
+    fn check_range(
+        &self,
+        start: usize,
+        end: usize,
+        status: Option<DeliveryStatus>,
+        violations: &mut Vec<Violation>,
+    ) {
+        let sentence = &self.text[start..end];
+        for (offset, verb) in unearned_claims(sentence, status) {
+            let absolute = start + offset;
+            let line = self.line_by_byte.get(absolute).copied().unwrap_or(1);
+            violations.push(Violation::new(
+                line,
+                format!(
+                    "claim word {verb:?} is applied to a planned deliverable without planned in the same sentence"
+                ),
+            ));
+        }
+    }
+}
+
+fn check_claim_unit(
+    unit: &str,
+    line: usize,
+    status: Option<DeliveryStatus>,
+    violations: &mut Vec<Violation>,
+) {
+    for (_, verb) in unearned_claims(unit, status) {
+        violations.push(Violation::new(
+            line,
+            format!(
+                "claim word {verb:?} is applied to a planned deliverable without planned in the same table row"
+            ),
+        ));
+    }
+}
+
+fn unearned_claims(unit: &str, status: Option<DeliveryStatus>) -> Vec<(usize, &'static str)> {
+    if status != Some(DeliveryStatus::Planned) {
+        return Vec::new();
+    }
+    let lower = unit.to_ascii_lowercase();
+    if contains_ascii_word(&lower, "planned") {
+        return Vec::new();
+    }
+    let mut claims = Vec::new();
+    for (pattern, verb) in [
+        ("relay supports", "supports"),
+        ("relay guarantees", "guarantees"),
+        ("relay provides", "provides"),
+    ] {
+        for (offset, _) in lower.match_indices(pattern) {
+            let end = offset + pattern.len();
+            if ascii_word_boundary(&lower, offset, end) && !inside_quotation(unit, offset) {
+                claims.push((offset, verb));
+            }
+        }
+    }
+    claims.sort_by_key(|claim| claim.0);
+    claims
+}
+
+fn contains_ascii_word(value: &str, word: &str) -> bool {
+    value
+        .match_indices(word)
+        .any(|(start, _)| ascii_word_boundary(value, start, start + word.len()))
+}
+
+fn ascii_word_boundary(value: &str, start: usize, end: usize) -> bool {
+    let before = value[..start].bytes().next_back();
+    let after = value[end..].bytes().next();
+    before.is_none_or(|byte| !(byte.is_ascii_alphanumeric() || byte == b'_'))
+        && after.is_none_or(|byte| !(byte.is_ascii_alphanumeric() || byte == b'_'))
+}
+
+fn inside_quotation(value: &str, offset: usize) -> bool {
+    value[..offset].bytes().filter(|byte| *byte == b'"').count() % 2 == 1
+        || (value[..offset].matches('“').count() > value[..offset].matches('”').count())
+}
+
+fn validate_workspace_r0_06(root: &Path) -> Vec<Violation> {
+    let gate_registry = root.join("ci/gates.toml");
+    let mut violations =
+        validate_document_tree(&root.join("docs"), Some(root), &[root.join("README.md")]);
+    match read_file(&gate_registry) {
+        Ok(gate_source) => violations.extend(qualify_violations(
+            &gate_registry,
+            validate_gates(&gate_source),
+        )),
+        Err(gate_violations) => violations.extend(gate_violations),
+    }
+    sort_violations(&mut violations);
+    violations
+}
+
+fn validate_document_tree(
+    docs_root: &Path,
+    boundary: Option<&Path>,
+    additional_documents: &[PathBuf],
+) -> Vec<Violation> {
+    let Some(boundary) = boundary else {
+        return vec![Violation::new(
+            1,
+            format!(
+                "{} line 1: documentation root has no containing boundary",
+                docs_root.display()
+            ),
+        )];
+    };
+    let mut violations = Vec::new();
+    let mut documents = Vec::new();
+    collect_markdown_documents(docs_root, &mut documents, &mut violations);
+    if documents.is_empty() {
+        violations.push(Violation::new(
+            1,
+            format!(
+                "{} line 1: documentation tree contains no Markdown files",
+                docs_root.display()
+            ),
+        ));
+    }
+    documents.extend(additional_documents.iter().cloned());
+    documents.sort();
+    documents.dedup();
+
+    for document in documents {
+        let source = match read_document(&document) {
+            Ok(source) => source,
+            Err(violation) => {
+                violations.push(violation);
+                continue;
+            }
+        };
+        violations.extend(qualify_violations(
+            &document,
+            validate_status_discipline(&source),
+        ));
+        violations.extend(validate_document_links(&document, &source, boundary));
+    }
+    sort_violations(&mut violations);
+    violations
+}
+
+fn read_document(document: &Path) -> Result<String, Violation> {
+    let metadata = fs::symlink_metadata(document).map_err(|error| {
+        Violation::new(
+            1,
+            format!(
+                "{} line 1: cannot inspect required documentation: {error}",
+                document.display()
+            ),
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(Violation::new(
+            1,
+            format!(
+                "{} line 1: required documentation must not be a symlink",
+                document.display()
+            ),
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(Violation::new(
+            1,
+            format!(
+                "{} line 1: required documentation is not a file",
+                document.display()
+            ),
+        ));
+    }
+    let bytes = fs::read(document).map_err(|error| {
+        Violation::new(
+            1,
+            format!(
+                "{} line 1: cannot read required documentation: {error}",
+                document.display()
+            ),
+        )
+    })?;
+    let source = String::from_utf8(bytes).map_err(|error| {
+        Violation::new(
+            1,
+            format!(
+                "{} line 1: documentation is not valid UTF-8: {error}",
+                document.display()
+            ),
+        )
+    })?;
+    if source.trim().is_empty() {
+        return Err(Violation::new(
+            1,
+            format!(
+                "{} line 1: required documentation must not be empty",
+                document.display()
+            ),
+        ));
+    }
+    Ok(source)
+}
+
+fn collect_markdown_documents(
+    directory: &Path,
+    documents: &mut Vec<PathBuf>,
+    violations: &mut Vec<Violation>,
+) {
+    let metadata = match fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            violations.push(Violation::new(
+                1,
+                format!(
+                    "{} line 1: cannot inspect documentation directory: {error}",
+                    directory.display()
+                ),
+            ));
+            return;
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        violations.push(Violation::new(
+            1,
+            format!(
+                "{} line 1: documentation symlink is not traversed",
+                directory.display()
+            ),
+        ));
+        return;
+    }
+    if !metadata.is_dir() {
+        violations.push(Violation::new(
+            1,
+            format!(
+                "{} line 1: documentation root is not a directory",
+                directory.display()
+            ),
+        ));
+        return;
+    }
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            violations.push(Violation::new(
+                1,
+                format!(
+                    "{} line 1: cannot read documentation directory: {error}",
+                    directory.display()
+                ),
+            ));
+            return;
+        }
+    };
+    let mut entries: Vec<_> = entries.collect();
+    entries.sort_by_key(|entry| {
+        entry
+            .as_ref()
+            .map_or_else(|_| PathBuf::new(), std::fs::DirEntry::path)
+    });
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                violations.push(Violation::new(
+                    1,
+                    format!(
+                        "{} line 1: cannot read documentation entry: {error}",
+                        directory.display()
+                    ),
+                ));
+                continue;
+            }
+        };
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                violations.push(Violation::new(
+                    1,
+                    format!(
+                        "{} line 1: cannot inspect documentation entry: {error}",
+                        path.display()
+                    ),
+                ));
+                continue;
+            }
+        };
+        if file_type.is_symlink() {
+            violations.push(Violation::new(
+                1,
+                format!(
+                    "{} line 1: documentation symlink is not traversed",
+                    path.display()
+                ),
+            ));
+        } else if file_type.is_dir() {
+            collect_markdown_documents(&path, documents, violations);
+        } else if file_type.is_file() && path.extension().and_then(OsStr::to_str) == Some("md") {
+            documents.push(path);
+        }
+    }
+}
+
+fn validate_document_links(document: &Path, source: &str, boundary: &Path) -> Vec<Violation> {
+    let (links, extraction_violations) = markdown_links(source);
+    let mut violations = qualify_violations(document, extraction_violations);
+    let Some(parent) = document.parent() else {
+        violations.push(Violation::new(
+            1,
+            format!(
+                "{} line 1: documentation file has no containing directory",
+                document.display()
+            ),
+        ));
+        return violations;
+    };
+    let boundary = lexical_normalize(boundary);
+    for link in links {
+        let Some(target) = relative_link_path(&link.target) else {
+            continue;
+        };
+        if target.contains('\\') {
+            violations.push(Violation::new(
+                link.line,
+                format!(
+                    "{} line {}: relative documentation link {target:?} contains a non-portable backslash",
+                    document.display(),
+                    link.line
+                ),
+            ));
+            continue;
+        }
+        let candidate = lexical_normalize(&parent.join(target));
+        if !candidate.starts_with(&boundary) {
+            violations.push(Violation::new(
+                link.line,
+                format!(
+                    "{} line {}: relative documentation link {target:?} escapes {}",
+                    document.display(),
+                    link.line,
+                    boundary.display()
+                ),
+            ));
+            continue;
+        }
+        match path_exists_with_exact_case(&boundary, &candidate) {
+            Ok(true) => {}
+            Ok(false) => violations.push(Violation::new(
+                link.line,
+                format!(
+                    "{} line {}: relative documentation link {target:?} does not resolve",
+                    document.display(),
+                    link.line
+                ),
+            )),
+            Err(message) => violations.push(Violation::new(
+                link.line,
+                format!("{} line {}: {message}", document.display(), link.line),
+            )),
+        }
+    }
+    violations
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(Path::new("/")),
+            std::path::Component::Normal(component) => normalized.push(component),
+        }
+    }
+    normalized
+}
+
+fn path_exists_with_exact_case(boundary: &Path, candidate: &Path) -> Result<bool, String> {
+    let relative = candidate.strip_prefix(boundary).map_err(|_| {
+        format!(
+            "relative documentation link target {} escapes {}",
+            candidate.display(),
+            boundary.display()
+        )
+    })?;
+    let mut cursor = boundary.to_path_buf();
+    if fs::symlink_metadata(&cursor)
+        .map_err(|error| format!("cannot inspect documentation link boundary: {error}"))?
+        .file_type()
+        .is_symlink()
+    {
+        return Err("documentation link boundary must not be a symlink".to_owned());
+    }
+    for component in relative.components() {
+        let std::path::Component::Normal(expected) = component else {
+            return Ok(false);
+        };
+        let entries = fs::read_dir(&cursor).map_err(|error| {
+            format!(
+                "cannot inspect documentation link directory {}: {error}",
+                cursor.display()
+            )
+        })?;
+        let mut found = None;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "cannot read documentation link directory {}: {error}",
+                    cursor.display()
+                )
+            })?;
+            if entry.file_name() == expected {
+                found = Some(entry.path());
+                break;
+            }
+        }
+        let Some(path) = found else {
+            return Ok(false);
+        };
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            format!(
+                "cannot inspect documentation link target {}: {error}",
+                path.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "documentation link target {} traverses a symlink",
+                path.display()
+            ));
+        }
+        cursor = path;
+    }
+    Ok(cursor.is_file() || cursor.is_dir())
+}
+
+fn sort_violations(violations: &mut [Violation]) {
+    violations.sort_by(|left, right| {
+        left.message
+            .cmp(&right.message)
+            .then(left.line.cmp(&right.line))
+    });
 }
 
 fn validate_workspace_sources(config: &ArchConfig, metadata: &WorkspaceMetadata) -> Vec<Violation> {

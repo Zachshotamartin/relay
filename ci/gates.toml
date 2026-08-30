@@ -1,0 +1,64 @@
+# Replayed in full by every CI run (NFR-MAINT-004).
+schema = 1
+
+[gate.R0]
+# The owner explicitly disabled branch protection, so R0 cannot be accepted.
+status = "in progress"
+section = "BUILD_PLAN.md §5"
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo clippy --workspace --all-targets --locked -- -D warnings",
+  "cargo test --workspace --locked",
+  "cargo deny check",
+  "cargo run -p arch-check --locked",
+]
+
+[gate.R1]
+status = "planned"
+section = "BUILD_PLAN.md §6"
+commands = []
+
+[gate.R2]
+status = "planned"
+section = "BUILD_PLAN.md §7"
+commands = []
+
+[gate.R3]
+status = "planned"
+section = "BUILD_PLAN.md §8"
+commands = []
+
+[gate.R4]
+status = "planned"
+section = "BUILD_PLAN.md §9"
+commands = []
+
+[gate.R5]
+status = "planned"
+section = "BUILD_PLAN.md §10"
+commands = []
+
+[gate.R6]
+status = "planned"
+section = "BUILD_PLAN.md §11"
+commands = []
+
+[gate.R7]
+status = "planned"
+section = "BUILD_PLAN.md §12"
+commands = []
+
+[gate.R8]
+status = "planned"
+section = "BUILD_PLAN.md §13"
+commands = []
+
+[gate.R9]
+status = "planned"
+section = "BUILD_PLAN.md §14"
+commands = []
+
+[gate.R10]
+status = "planned"
+section = "BUILD_PLAN.md §15"
+commands = []

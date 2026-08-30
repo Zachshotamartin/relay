@@ -60,6 +60,35 @@ class ParseRegistryTests(unittest.TestCase):
         with self.assertRaisesRegex(run_gates.RegistryError, "accepted.*commands"):
             run_gates.parse_registry(registry(r0_commands=""))
 
+    def test_r0_gate_08_accepts_multiline_commands_with_trailing_comma(self) -> None:
+        multiline = registry(r0_commands='\n  "first",\n  "second",\n')
+
+        parsed = run_gates.parse_registry(multiline)
+
+        self.assertEqual(("first", "second"), parsed.gates["R0"].commands)
+
+    def test_r0_gate_09_checked_registry_has_exact_r0_and_planned_tail(self) -> None:
+        repository_root = Path(__file__).resolve().parents[2]
+        parsed = run_gates.parse_registry(
+            (repository_root / "ci" / "gates.toml").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual("in progress", parsed.gates["R0"].status)
+        self.assertEqual(
+            (
+                "cargo fmt --all -- --check",
+                "cargo clippy --workspace --all-targets --locked -- -D warnings",
+                "cargo test --workspace --locked",
+                "cargo deny check",
+                "cargo run -p arch-check --locked",
+            ),
+            parsed.gates["R0"].commands,
+        )
+        for number in range(1, 11):
+            gate = parsed.gates[f"R{number}"]
+            self.assertEqual("planned", gate.status)
+            self.assertEqual((), gate.commands)
+
 
 class ReplayRegistryTests(unittest.TestCase):
     def test_r0_gate_06_replays_only_accepted_commands_in_registry_order(self) -> None:

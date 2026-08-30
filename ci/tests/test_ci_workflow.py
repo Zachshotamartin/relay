@@ -8,6 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 JUSTFILE = ROOT / "justfile"
+SETUP_JUST_ACTION = ROOT / ".github" / "actions" / "setup-just" / "action.yml"
 JOBS = ("fmt", "lint", "msrv", "deny", "arch", "test", "gates")
 
 
@@ -59,11 +60,17 @@ class WorkflowGraphTests(unittest.TestCase):
                 continue
             self.assertRegex(action_ref, r"^[^@\s]+@[0-9a-f]{40}$")
         self.assertEqual(7, workflow.count("persist-credentials: false"))
-        self.assertEqual(7, workflow.count('github-token: ""'))
+        self.assertEqual(7, workflow.count("uses: ./.github/actions/setup-just"))
+        self.assertNotIn("extractions/setup-just", workflow)
+        self.assertNotIn("github-token", workflow)
+        self.assertNotIn("github.token", workflow)
         self.assertIn("toolchain: 1.85.0", workflow)
-        self.assertIn("just-version: 1.36.0", workflow)
         self.assertNotIn("${{ secrets.", workflow)
         self.assertNotRegex(workflow, r"(?i)(?:^|/)cache(?:@|/)")
+
+        setup_just = source(SETUP_JUST_ACTION)
+        self.assertIn("cargo install just --version 1.36.0 --locked", setup_just)
+        self.assertIn('test "$(just --version)" = "just 1.36.0"', setup_just)
 
         deny = mapping_block(mapping_block(workflow, "jobs", indent=0), "deny", indent=2)
         self.assertIn(

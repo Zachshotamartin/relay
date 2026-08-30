@@ -163,6 +163,38 @@ class CanaryScanTests(unittest.TestCase):
         self.assertIn(b"raw", completed.stderr)
         self.assertNotIn(secret, completed.stderr)
 
+    def test_r0_canary_13_detects_wrapped_base64_spaced_hex_and_url_encoding(self) -> None:
+        raw = b"RELAY_CANARY_secret"
+        base64_value = base64.b64encode(raw)
+        wrapped_base64 = b"\n".join(
+            base64_value[index : index + 4]
+            for index in range(0, len(base64_value), 4)
+        )
+        spaced_hex = b" ".join(
+            raw.hex().encode("ascii")[index : index + 2]
+            for index in range(0, len(raw.hex()), 2)
+        )
+        url_encoded = b"".join(f"%{byte:02X}".encode("ascii") for byte in raw)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "artifact.bin"
+            path.write_bytes(wrapped_base64 + b"\n" + spaced_hex + b"\n" + url_encoded)
+
+            encodings = {finding.encoding for finding in check_canaries.scan_paths([path])}
+
+        self.assertEqual({"base64", "hex", "url"}, encodings)
+
+    def test_r0_canary_14_redacts_encoded_canary_from_finding_path(self) -> None:
+        raw = b"RELAY_CANARY_path-secret"
+        encoded_name = base64.urlsafe_b64encode(raw).decode("ascii")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / encoded_name
+            path.write_bytes(raw)
+
+            finding = check_canaries.scan_paths([path])[0]
+
+        self.assertNotIn(encoded_name, repr(finding))
+        self.assertNotIn(raw.decode("ascii"), repr(finding))
+
 
 if __name__ == "__main__":
     unittest.main()

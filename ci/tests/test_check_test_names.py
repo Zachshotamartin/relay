@@ -153,6 +153,33 @@ pub async fn missing_family_prefix() {}
 
             self.assertEqual([], check_test_names.find_violations(root))
 
+    def test_r0_name_10_detects_cfg_attr_tests_and_dynamic_macro_names(self) -> None:
+        source = """#[cfg_attr(all(), test)]
+fn conditional_missing_family() {}
+
+#[cfg_attr(test, ignore)]
+fn helper_is_not_a_test() {}
+
+macro_rules! make_test {
+    ($name:ident) => {
+        #[test]
+        fn $name() {}
+    };
+}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tests" / "generated.rs"
+            path.parent.mkdir()
+            path.write_text(source, encoding="utf-8")
+
+            violations = check_test_names.find_violations(Path(directory))
+
+        self.assertEqual(
+            ["conditional_missing_family", "<dynamic-test-name>"],
+            [violation.name for violation in violations],
+        )
+        self.assertEqual([2, 9], [violation.line for violation in violations])
+
 
 if __name__ == "__main__":
     unittest.main()

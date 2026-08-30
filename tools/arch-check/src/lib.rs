@@ -5413,6 +5413,12 @@ forbidden-tokens = []
         let uppercase = validate_status_discipline("**Status:** PLANNED.\n");
         assert_eq!(uppercase.len(), 1, "{uppercase:?}");
         assert_eq!(uppercase[0].line, 1);
+
+        let proposed_adr = "# ADR-0012: Tool compatibility\n\n- Status: proposed\n";
+        assert!(
+            validate_status_discipline(proposed_adr).is_empty(),
+            "a proposed ADR is a valid decision status"
+        );
     }
 
     #[test]

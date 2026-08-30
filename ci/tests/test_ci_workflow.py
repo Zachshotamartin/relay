@@ -59,6 +59,7 @@ class WorkflowGraphTests(unittest.TestCase):
                 continue
             self.assertRegex(action_ref, r"^[^@\s]+@[0-9a-f]{40}$")
         self.assertEqual(7, workflow.count("persist-credentials: false"))
+        self.assertEqual(7, workflow.count('github-token: ""'))
         self.assertIn("toolchain: 1.85.0", workflow)
         self.assertIn("just-version: 1.36.0", workflow)
         self.assertNotIn("${{ secrets.", workflow)
@@ -115,7 +116,8 @@ class WorkflowGraphTests(unittest.TestCase):
             "deny": "cargo deny check",
             "arch": "cargo run -p arch-check --locked",
             "test": (
-                "python3 ci/check_test_names.py .\n"
+                "cargo build --workspace --locked\n"
+                "    python3 ci/check_test_names.py .\n"
                 "    python3 ci/check_canaries.py --capture -- cargo test --workspace --locked"
             ),
             "gates": "python3 ci/run_gates.py",

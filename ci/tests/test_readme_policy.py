@@ -76,6 +76,10 @@ class ReadmePolicyTests(unittest.TestCase):
             cursor = position + len(phrase)
         self.assertIn("a flake is a bug", contributing)
         self.assertIn("fixtures/seeds/", contributing)
+        self.assertIn("lowercase evidence-family prefix", contributing)
+        self.assertIn("core_", contributing)
+        self.assertIn("mkt_", contributing)
+        self.assertIn("operations_test_plan.md#10-detailed-verification-matrices", contributing)
 
 
 if __name__ == "__main__":

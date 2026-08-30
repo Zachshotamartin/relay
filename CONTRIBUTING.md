@@ -32,6 +32,9 @@ defined by the verification matrices in
 `fuzz_`, `raft_`, `admn_`, `opsx_`, `migr_`, `soak_`, `bench_`, `mut_`, or
 `mkt_`. The prefix is part of the function name so CI can count evidence by
 family; generated tests whose function name cannot be inspected fail closed.
+CI also treats unresolved or qualified function attributes in a `tests/` tree
+as potential test generators, so attributed helpers use a family prefix or live
+outside that tree.
 
 ## Zero-flake policy
 

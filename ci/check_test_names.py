@@ -269,7 +269,10 @@ def _is_potential_test_attribute(contents: str) -> bool:
     if remainder.startswith("::") and "$" in remainder:
         return True
     if attribute_name != "cfg_attr":
-        return attribute_name not in _NON_TEST_FUNCTION_ATTRIBUTE_NAMES
+        return (
+            len(segments) != 1
+            or attribute_name not in _NON_TEST_FUNCTION_ATTRIBUTE_NAMES
+        )
     arguments = _top_level_arguments(remainder)
     if arguments is None or len(arguments) < 2:
         return False

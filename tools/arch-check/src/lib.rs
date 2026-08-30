@@ -1207,6 +1207,248 @@ mod tests {
         assert!(stderr.contains("cannot read"), "{stderr}");
     }
 
+    fn metadata_with_workspace_packages(package_names: &[&str]) -> String {
+        let packages = package_names
+            .iter()
+            .map(|name| {
+                format!(
+                    r#"{{"name":"{name}","id":"path+file:///fixture/{name}#0.1.0","manifest_path":"/fixture/{name}/Cargo.toml","dependencies":[]}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let members = package_names
+            .iter()
+            .map(|name| format!(r#""path+file:///fixture/{name}#0.1.0""#))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(r#"{{"packages":[{packages}],"workspace_members":[{members}]}}"#)
+    }
+
+    fn metadata_with_dependency(kind: &str) -> String {
+        format!(
+            r#"{{"packages":[{{"name":"relay-wal","id":"path+file:///fixture/relay-wal#0.1.0","manifest_path":"/fixture/relay-wal/Cargo.toml","dependencies":[{{"name":"proptest","rename":null,"kind":{kind}}}]}}],"workspace_members":["path+file:///fixture/relay-wal#0.1.0"]}}"#
+        )
+    }
+
+    #[test]
+    fn arch_r0_04_review_requires_exact_policy_and_workspace_coverage() {
+        const PRODUCT_CRATES: [&str; 10] = [
+            "relay-core",
+            "relay-wal",
+            "relay-raft",
+            "relay-sim",
+            "relay-model",
+            "relay-wire",
+            "relay-server",
+            "relay-client",
+            "relay-cli",
+            "relay-bench",
+        ];
+        let real_policy = parse_arch_config(include_str!("../arch.toml"))
+            .expect("the real architecture policy must parse");
+        assert_eq!(
+            real_policy
+                .crates
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            PRODUCT_CRATES.into_iter().collect::<BTreeSet<_>>()
+        );
+
+        let incomplete_policy =
+            parse_arch_config(include_str!("../fixtures/r0_04/arch-nine-policies.toml"))
+                .expect("partial policies remain valid for deterministic fixtures");
+        let mut all_workspace_packages = PRODUCT_CRATES.to_vec();
+        all_workspace_packages.push("arch-check");
+        let full_metadata =
+            parse_cargo_metadata(&metadata_with_workspace_packages(&all_workspace_packages))
+                .expect("the exact real workspace shape must parse");
+        let policy_errors = validate_dependency_graph(&incomplete_policy, &full_metadata);
+        assert!(
+            policy_errors
+                .iter()
+                .any(|violation| violation.message.contains("relay-bench")),
+            "{policy_errors:?}"
+        );
+
+        let ten_only = parse_cargo_metadata(&metadata_with_workspace_packages(&PRODUCT_CRATES))
+            .expect("structurally valid metadata remains parseable before shape validation");
+        let missing_tool_errors = validate_dependency_graph(&real_policy, &ten_only);
+        assert!(
+            missing_tool_errors
+                .iter()
+                .any(|violation| violation.message.contains("arch-check")),
+            "{missing_tool_errors:?}"
+        );
+        assert!(
+            validate_dependency_graph(&real_policy, &full_metadata).is_empty(),
+            "exactly ten product crates plus arch-check must be accepted"
+        );
+
+        let mut rogue_workspace = all_workspace_packages;
+        rogue_workspace.push("relay-rogue");
+        let rogue_metadata =
+            parse_cargo_metadata(&metadata_with_workspace_packages(&rogue_workspace))
+                .expect("rogue-package metadata is structurally valid");
+        let rogue_errors = validate_dependency_graph(&real_policy, &rogue_metadata);
+        assert!(
+            rogue_errors
+                .iter()
+                .any(|violation| violation.message.contains("relay-rogue")),
+            "{rogue_errors:?}"
+        );
+    }
+
+    #[test]
+    fn arch_r0_04_review_rejects_versionless_path_and_git_but_accepts_workspace() {
+        let manifest = r#"
+[dependencies]
+local = { path = "../local" }
+remote = { git = "https://example.invalid/repo" }
+inherited = { workspace = true }
+"#;
+        let violations = check_exact_requirements(manifest);
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.message.contains("local"))
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.message.contains("remote"))
+        );
+        assert!(
+            violations
+                .iter()
+                .all(|violation| !violation.message.contains("inherited"))
+        );
+    }
+
+    #[test]
+    fn arch_r0_04_review_retains_dependency_kind_and_separates_dev_allowlist() {
+        let policy = parse_arch_config(include_str!("../fixtures/r0_04/arch-kind-policy.toml"))
+            .expect("kind fixture policy must parse");
+        let normal = parse_cargo_metadata(&metadata_with_dependency("null"))
+            .expect("normal dependency metadata must parse");
+        let development = parse_cargo_metadata(&metadata_with_dependency(r#""dev""#))
+            .expect("development dependency metadata must parse");
+
+        let normal_violations = validate_dependency_graph(&policy, &normal);
+        assert!(
+            normal_violations.iter().any(|violation| {
+                violation.message.contains("relay-wal")
+                    && violation.message.contains("proptest")
+                    && violation.message.contains("normal")
+            }),
+            "{normal_violations:?}"
+        );
+        assert!(
+            validate_dependency_graph(&policy, &development).is_empty(),
+            "a test-only dependency should be accepted only as kind=dev"
+        );
+
+        let production = parse_arch_config(include_str!("../arch.toml"))
+            .expect("real architecture policy must parse");
+        assert!(
+            !production.crates["relay-wal"]
+                .allowed_deps
+                .contains("proptest")
+        );
+        assert!(
+            !production.crates["relay-wal"]
+                .allowed_deps
+                .contains("tempfile")
+        );
+        assert!(
+            !production.crates["relay-bench"]
+                .allowed_deps
+                .contains("criterion")
+        );
+    }
+
+    #[test]
+    fn arch_r0_04_review_dependency_table_fields_and_version_are_validated() {
+        let exact = r#"
+[dependencies.bytes]
+version = "=1.9.0"
+default-features = false
+features = ["std"]
+"#;
+        assert!(
+            check_exact_requirements(exact).is_empty(),
+            "non-version fields in a dependency table must not be parsed as requirements"
+        );
+
+        let missing = r#"
+[dependencies.bytes]
+default-features = false
+features = ["std"]
+"#;
+        let missing_violations = check_exact_requirements(missing);
+        assert_eq!(missing_violations.len(), 1, "{missing_violations:?}");
+        assert!(missing_violations[0].message.contains("bytes"));
+        assert!(missing_violations[0].message.contains("missing"));
+
+        let floating = "[dependencies.bytes]\nversion = \"1.9\"\n";
+        let floating_violations = check_exact_requirements(floating);
+        assert_eq!(floating_violations.len(), 1, "{floating_violations:?}");
+        assert!(floating_violations[0].message.contains("bytes"));
+    }
+
+    #[test]
+    fn arch_r0_04_review_dotted_dependency_keys_are_checked() {
+        let manifest = r#"
+[dependencies]
+bytes.version = "1.9"
+relay-core.workspace = true
+"#;
+        let violations = check_exact_requirements(manifest);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0]
+                .message
+                .contains("dependency bytes must use an exact"),
+            "{}",
+            violations[0].message
+        );
+        assert!(!violations[0].message.contains("relay-core"));
+    }
+
+    #[test]
+    fn arch_r0_04_review_rejects_allowed_forbidden_overlap() {
+        let policy = r#"
+[crate.relay-core]
+allowed-deps = ["im", "rand"]
+forbidden-deps = ["rand"]
+forbidden-tokens = []
+"#;
+        let violations = parse_arch_config(policy)
+            .expect_err("a dependency cannot be simultaneously allowed and forbidden");
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.message.contains("rand")
+                    && violation.message.contains("both")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn arch_r0_04_review_rejects_empty_array_entries() {
+        let malformed = include_str!("../fixtures/r0_04/arch-empty-array-entry.toml");
+        let violations = parse_arch_config(malformed)
+            .expect_err("leading or repeated commas are malformed TOML array entries");
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.message.contains("empty array entry")),
+            "{violations:?}"
+        );
+    }
+
     #[test]
     fn arch_purity_reports_code_but_ignores_comments_and_cfg_test_module() {
         let source = "// SystemTime::now is forbidden\nfn bad() { SystemTime::now(); }\n#[cfg(test)]\nmod tests { fn allowed() { SystemTime::now(); } }\n";

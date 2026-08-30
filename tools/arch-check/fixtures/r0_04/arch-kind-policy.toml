@@ -1,0 +1,5 @@
+[crate.relay-wal]
+allowed-deps = ["bytes", "crc32c", "relay-core"]
+allowed-dev-deps = ["proptest", "tempfile"]
+forbidden-deps = ["relay-raft", "relay-server", "tokio"]
+forbidden-tokens = []

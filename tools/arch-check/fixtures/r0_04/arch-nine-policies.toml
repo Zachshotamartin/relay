@@ -1,0 +1,44 @@
+[crate.relay-core]
+allowed-deps = []
+forbidden-deps = []
+forbidden-tokens = []
+
+[crate.relay-wal]
+allowed-deps = []
+forbidden-deps = []
+forbidden-tokens = []
+
+[crate.relay-raft]
+allowed-deps = []
+forbidden-deps = []
+forbidden-tokens = []
+
+[crate.relay-sim]
+allowed-deps = []
+forbidden-deps = []
+forbidden-tokens = []
+
+[crate.relay-model]
+allowed-deps = []
+forbidden-deps = []
+forbidden-tokens = []
+
+[crate.relay-wire]
+allowed-deps = []
+forbidden-deps = []
+forbidden-tokens = []
+
+[crate.relay-server]
+allowed-deps = []
+forbidden-deps = []
+forbidden-tokens = []
+
+[crate.relay-client]
+allowed-deps = []
+forbidden-deps = []
+forbidden-tokens = []
+
+[crate.relay-cli]
+allowed-deps = []
+forbidden-deps = []
+forbidden-tokens = []

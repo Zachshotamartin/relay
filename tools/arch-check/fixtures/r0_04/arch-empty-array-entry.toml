@@ -1,0 +1,4 @@
+[crate.relay-core]
+allowed-deps = ["im", , "sha2"]
+forbidden-deps = []
+forbidden-tokens = []

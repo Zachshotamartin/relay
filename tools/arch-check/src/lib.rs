@@ -1622,6 +1622,28 @@ mod tests {
     }
 
     #[test]
+    fn arch_r0_04_review_rejects_configured_rogue_workspace_crate() {
+        let mut policy_source = include_str!("../arch.toml").to_owned();
+        policy_source.push_str(
+            "\n[crate.relay-rogue]\nallowed-deps = []\nforbidden-deps = []\nforbidden-tokens = []\n",
+        );
+        let policy = parse_arch_config(&policy_source)
+            .expect("configured-rogue policy is syntactically valid");
+        let mut workspace_packages = PRODUCT_CRATES.to_vec();
+        workspace_packages.extend(["arch-check", "relay-rogue"]);
+        let metadata = parse_cargo_metadata(&metadata_with_workspace_packages(&workspace_packages))
+            .expect("configured-rogue metadata is structurally valid");
+
+        let violations = validate_dependency_graph(&policy, &metadata);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.message.contains("relay-rogue")),
+            "a configured rogue workspace crate bypassed the exact shape check: {violations:?}"
+        );
+    }
+
+    #[test]
     fn arch_r0_04_review_rejects_versionless_path_and_git_but_accepts_workspace() {
         let manifest = r#"
 [dependencies]

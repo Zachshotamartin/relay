@@ -224,6 +224,23 @@ def _is_test_attribute(contents: str) -> bool:
     return any(_is_test_attribute(argument) for argument in arguments[1:])
 
 
+def _is_potential_test_attribute(contents: str) -> bool:
+    """Recognize tests plus macro-generated attributes that could become tests."""
+
+    if _is_test_attribute(contents):
+        return True
+    match = _ATTRIBUTE_PATH.match(contents)
+    if match is None:
+        return "$" in contents
+    segments = re.findall(_IDENTIFIER, match.group("path"))
+    if not segments or segments[-1].removeprefix("r#") != "cfg_attr":
+        return False
+    arguments = _top_level_arguments(contents[match.end() :].lstrip())
+    if arguments is None or len(arguments) < 2:
+        return False
+    return any(_is_potential_test_attribute(argument) for argument in arguments[1:])
+
+
 def _skip_attributes(source: str, cursor: int) -> int:
     while True:
         cursor += len(source[cursor:]) - len(source[cursor:].lstrip())
@@ -243,7 +260,9 @@ def _test_functions(source: str) -> Iterator[tuple[str, int]]:
     for attribute in _ATTRIBUTE_START.finditer(masked):
         opening = masked.find("[", attribute.start(), attribute.end())
         closing = _matching_bracket(masked, opening)
-        if closing is None or not _is_test_attribute(masked[opening + 1 : closing]):
+        if closing is None or not _is_potential_test_attribute(
+            masked[opening + 1 : closing]
+        ):
             continue
         function_start = _skip_attributes(masked, closing + 1)
         function = _FUNCTION.match(masked, function_start)

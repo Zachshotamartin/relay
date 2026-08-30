@@ -10,7 +10,7 @@ forbidden-tokens = ["std::time", "std::fs", "std::io", "std::net", "std::thread"
 allowed-deps = ["bytes", "crc32c", "relay-core"]
 allowed-dev-deps = ["proptest", "tempfile"]
 forbidden-deps = ["relay-raft", "relay-server", "tokio"]
-forbidden-tokens = ["std::fs", "SystemTime::now", "Instant::now", "tokio::"]
+forbidden-tokens = ["std::fs", "std::time", "SystemTime::now", "Instant::now", "tokio::"]
 
 [crate.relay-raft]
 allowed-deps = ["relay-core", "relay-wal"]

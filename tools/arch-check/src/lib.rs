@@ -550,6 +550,11 @@ pub fn scan_source(source: &str, tokens: &[String]) -> Vec<Violation> {
     violations
 }
 
+#[must_use]
+pub fn validate_source_layout(_manifest: &str) -> Vec<Violation> {
+    Vec::new()
+}
+
 /// Runs only the R0.05 source checks against a deterministic fixture tree.
 ///
 /// # Errors
@@ -3327,6 +3332,134 @@ fn production() {
         );
         assert!(stderr.contains("lib.rs"), "{stderr}");
         assert!(stderr.contains("UTF-8"), "{stderr}");
+    }
+
+    #[test]
+    fn arch_r0_05_does_not_mask_production_after_lifetime_test_item() {
+        let source = r#"
+pub fn consume<T>() {}
+
+#[cfg(test)]
+#[allow(dead_code)]
+#[rustfmt::skip]
+fn helper<'a>() { consume::<&'a str>() }
+
+pub fn production() {
+    let _ = std::time::SystemTime::now();
+}
+"#;
+        let violations = scan_source(
+            source,
+            &["std::time".to_owned(), "SystemTime::now".to_owned()],
+        );
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        assert!(violations.iter().all(|item| item.line == 10));
+    }
+
+    #[test]
+    fn arch_r0_05_matches_forbidden_token_sequences_across_trivia_and_use_trees() {
+        let split_path =
+            "fn production() { let _ = std /* split */ :: time :: SystemTime :: now(); }\n";
+        let split_violations = scan_source(
+            split_path,
+            &["std::time".to_owned(), "SystemTime::now".to_owned()],
+        );
+        assert_eq!(split_violations.len(), 2, "{split_violations:?}");
+        assert!(split_violations.iter().all(|item| item.line == 1));
+
+        let use_tree =
+            "use std::{time::SystemTime as Clock};\nfn production() { let _ = Clock::now(); }\n";
+        let use_violations = scan_source(use_tree, &["std::time".to_owned()]);
+        assert_eq!(use_violations.len(), 1, "{use_violations:?}");
+        assert_eq!(use_violations[0].line, 1);
+    }
+
+    #[test]
+    fn arch_r0_05_scans_included_rust_sources_without_rs_extension() {
+        let temp_root =
+            std::env::temp_dir().join(format!("relay-arch-r0-05-include-{}", std::process::id()));
+        let source_dir = temp_root.join("crates/relay-core/src");
+        fs::create_dir_all(&source_dir).expect("temporary source tree must be created");
+        fs::write(source_dir.join("lib.rs"), "include!(\"impl.inc\");\n")
+            .expect("crate root must be written");
+        fs::write(
+            source_dir.join("impl.inc"),
+            "fn production() { let _ = SystemTime::now(); }\n",
+        )
+        .expect("included Rust source must be written");
+
+        let result =
+            check_source_fixture_files(&temp_root, &fixture_path("../r0_05/arch-source.toml"));
+        fs::remove_dir_all(&temp_root).expect("temporary fixture must be removed");
+        let violations = result.expect_err("included source must be scanned");
+        assert!(
+            violations
+                .iter()
+                .any(|item| item.message.contains("impl.inc")
+                    && item.message.contains("SystemTime::now")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn arch_r0_05_rejects_unscanned_custom_target_paths() {
+        let manifest = "[lib]\npath = \"outside/lib.rs\"\n";
+        let violations = validate_source_layout(manifest);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].message.contains("custom target path"));
+    }
+
+    #[test]
+    fn arch_r0_05_real_policy_covers_every_normative_raft_api() {
+        let config = parse_arch_config(include_str!("../arch.toml"))
+            .expect("real architecture policy must parse");
+        let raft = config
+            .crates
+            .get("relay-raft")
+            .expect("relay-raft policy must exist");
+        for required in [
+            "SystemTime::now",
+            "Instant::now",
+            "thread::sleep",
+            "std::fs",
+            "std::net",
+            "rand::",
+            "tokio::",
+        ] {
+            assert!(
+                raft.forbidden_tokens.iter().any(|token| token == required),
+                "relay-raft policy is missing {required:?}: {:?}",
+                raft.forbidden_tokens
+            );
+        }
+    }
+
+    #[test]
+    fn arch_r0_05_ignores_out_of_line_cfg_test_modules() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "relay-arch-r0-05-out-of-line-test-{}",
+            std::process::id()
+        ));
+        let source_dir = temp_root.join("crates/relay-core/src");
+        fs::create_dir_all(&source_dir).expect("temporary source tree must be created");
+        fs::write(
+            source_dir.join("lib.rs"),
+            "#[cfg(test)]\nmod tests;\npub fn production() {}\n",
+        )
+        .expect("crate root must be written");
+        fs::write(
+            source_dir.join("tests.rs"),
+            "#[test]\nfn test_only() { let _ = SystemTime::now(); }\n",
+        )
+        .expect("test module must be written");
+
+        let result =
+            check_source_fixture_files(&temp_root, &fixture_path("../r0_05/arch-source.toml"));
+        fs::remove_dir_all(&temp_root).expect("temporary fixture must be removed");
+        assert!(
+            result.is_ok(),
+            "out-of-line cfg(test) was scanned: {result:?}"
+        );
     }
 
     fn metadata_with_workspace_packages(package_names: &[&str]) -> String {

@@ -74,6 +74,7 @@ class WorkflowGraphTests(unittest.TestCase):
             "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f",
             deny,
         )
+        self.assertEqual(2, workflow.count("cargo deny --version"))
 
     def test_r0_ci_03_has_required_linux_and_advisory_macos_matrix(self) -> None:
         workflow = source(WORKFLOW)

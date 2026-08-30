@@ -2005,7 +2005,27 @@ fn clean_markdown_prose(source: &str) -> String {
         }
         line_start = (line_end + 1).min(bytes.len());
     }
+    mask_multiline_code_spans(&mut cleaned);
     String::from_utf8(cleaned).unwrap_or_else(|_| source.to_owned())
+}
+
+fn mask_multiline_code_spans(cleaned: &mut [u8]) {
+    let mut index = 0;
+    while index < cleaned.len() {
+        if cleaned[index] != b'`' {
+            index += 1;
+            continue;
+        }
+        let run = repeated_byte(cleaned, index, cleaned.len(), b'`');
+        let close = find_byte_run(cleaned, index + run, cleaned.len(), b'`', run);
+        if let Some(close) = close {
+            let end = close + run;
+            mask_markdown_range(cleaned, index, end);
+            index = end;
+        } else {
+            index += run;
+        }
+    }
 }
 
 fn fence_marker(line: &[u8]) -> Option<(u8, usize)> {

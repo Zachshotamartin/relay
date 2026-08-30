@@ -180,6 +180,24 @@ macro_rules! make_test {
         )
         self.assertEqual([2, 9], [violation.line for violation in violations])
 
+    def test_r0_name_11_rejects_pasted_macro_test_names(self) -> None:
+        source = """macro_rules! make_test {
+    ($name:ident) => {
+        #[test]
+        fn [<$name _case>]() {}
+    };
+}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tests" / "generated.rs"
+            path.parent.mkdir()
+            path.write_text(source, encoding="utf-8")
+
+            violations = check_test_names.find_violations(Path(directory))
+
+        self.assertEqual(["<dynamic-test-name>"], [item.name for item in violations])
+        self.assertEqual([3], [item.line for item in violations])
+
 
 if __name__ == "__main__":
     unittest.main()

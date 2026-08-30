@@ -94,4 +94,3 @@ mod tests {
         assert_eq!(violations[0].line, 2);
     }
 }
-

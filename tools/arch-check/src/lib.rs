@@ -4887,6 +4887,15 @@ forbidden-tokens = []
     }
 
     #[test]
+    fn arch_r0_06_dangling_reference_labels_fail_closed() {
+        let violations = validate_relative_links("[guide][missing]\n", &[]);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].line, 1);
+        assert!(violations[0].message.contains("missing"));
+        assert!(violations[0].message.contains("reference"));
+    }
+
+    #[test]
     fn arch_r0_06_gate_sequence_rejects_accepted_after_unaccepted() {
         let invalid_sequence = valid_gate_registry()
             .replacen("status = \"accepted\"", "status = \"in progress\"", 1)
@@ -4897,6 +4906,20 @@ forbidden-tokens = []
                 && item.message.contains("R1")
                 && item.message.contains("R0")),
             "{sequence_violations:?}"
+        );
+    }
+
+    #[test]
+    fn arch_r0_06_gate_sequence_allows_only_one_in_progress_gate() {
+        let invalid_sequence = valid_gate_registry()
+            .replacen("status = \"accepted\"", "status = \"in progress\"", 1)
+            .replacen("status = \"planned\"", "status = \"in progress\"", 1);
+        let violations = validate_gates(&invalid_sequence);
+        assert!(
+            violations.iter().any(|item| item.line == 9
+                && item.message.contains("R1")
+                && item.message.contains("in progress")),
+            "{violations:?}"
         );
     }
 

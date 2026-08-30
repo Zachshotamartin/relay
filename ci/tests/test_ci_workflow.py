@@ -124,6 +124,22 @@ class WorkflowGraphTests(unittest.TestCase):
             r"(?m)^ci-local: fmt lint msrv deny arch test gates$",
         )
 
+    def test_r0_ci_06_wires_test_names_canaries_and_pr_policy(self) -> None:
+        justfile = source(JUSTFILE)
+        workflow = source(WORKFLOW)
+        arch = mapping_block(mapping_block(workflow, "jobs", indent=0), "arch", indent=2)
+
+        self.assertIn("python3 ci/check_test_names.py .", justfile)
+        self.assertIn(
+            "python3 ci/check_canaries.py --capture -- cargo test --workspace --locked",
+            justfile,
+        )
+        self.assertIn("pr-policy:", justfile)
+        self.assertIn("python3 ci/check_pr_policy.py", justfile)
+        self.assertIn("RELAY_PR_TITLE: ${{ github.event.pull_request.title }}", arch)
+        self.assertIn("RELAY_PR_BODY: ${{ github.event.pull_request.body }}", arch)
+        self.assertRegex(arch, r"(?m)^      - run: just pr-policy$")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -522,6 +522,7 @@ pub fn check_workspace_r0_04(root: &Path) -> Result<(), Vec<Violation>> {
             )),
         }
     }
+    violations.extend(validate_workspace_sources(&config, &metadata));
     if violations.is_empty() {
         Ok(())
     } else {
@@ -530,8 +531,53 @@ pub fn check_workspace_r0_04(root: &Path) -> Result<(), Vec<Violation>> {
 }
 
 #[must_use]
-pub fn scan_source(_source: &str, _tokens: &[String]) -> Vec<Violation> {
-    Vec::new()
+pub fn scan_source(source: &str, tokens: &[String]) -> Vec<Violation> {
+    let (mut cleaned, syntax) = lex_rust(source);
+    mask_cfg_test_items(&mut cleaned, &syntax);
+    let cleaned = String::from_utf8(cleaned).unwrap_or_else(|_| source.to_owned());
+    let mut violations = Vec::new();
+    for (line_index, line) in cleaned.lines().enumerate() {
+        for token in tokens {
+            if !token.is_empty() && line.contains(token) {
+                violations.push(Violation::new(
+                    line_index + 1,
+                    format!("forbidden source token {token:?}"),
+                ));
+            }
+        }
+    }
+    violations
+}
+
+/// Runs only the R0.05 source checks against a deterministic fixture tree.
+///
+/// # Errors
+///
+/// Returns policy parse failures, missing configured source roots, traversal
+/// failures, malformed UTF-8, and forbidden-token hits with file and line.
+pub fn check_source_fixture_files(
+    source_root: &Path,
+    config_path: &Path,
+) -> Result<(), Vec<Violation>> {
+    let config_source = read_file(config_path)?;
+    let config = parse_arch_config(&config_source)
+        .map_err(|violations| qualify_violations(config_path, violations))?;
+    let roots = config
+        .crates
+        .keys()
+        .map(|crate_name| {
+            (
+                crate_name.clone(),
+                source_root.join("crates").join(crate_name).join("src"),
+            )
+        })
+        .collect();
+    let violations = validate_source_roots(&config, &roots);
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations)
+    }
 }
 
 #[must_use]
@@ -552,6 +598,364 @@ pub fn validate_test_names(_source: &str) -> Vec<Violation> {
 #[must_use]
 pub fn scan_canaries(_source: &str) -> Vec<Violation> {
     Vec::new()
+}
+
+fn validate_workspace_sources(config: &ArchConfig, metadata: &WorkspaceMetadata) -> Vec<Violation> {
+    let mut roots = BTreeMap::new();
+    for crate_name in config.crates.keys() {
+        let Some(package) = metadata.packages.get(crate_name) else {
+            continue;
+        };
+        let Some(package_root) = package.manifest_path.parent() else {
+            roots.insert(crate_name.clone(), PathBuf::new());
+            continue;
+        };
+        roots.insert(crate_name.clone(), package_root.join("src"));
+    }
+    validate_source_roots(config, &roots)
+}
+
+fn validate_source_roots(config: &ArchConfig, roots: &BTreeMap<String, PathBuf>) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    for (crate_name, policy) in &config.crates {
+        let Some(source_root) = roots.get(crate_name) else {
+            violations.push(Violation::new(
+                1,
+                format!("configured crate {crate_name} source directory is missing"),
+            ));
+            continue;
+        };
+        if !source_root.is_dir() {
+            violations.push(Violation::new(
+                1,
+                format!(
+                    "configured crate {crate_name} source directory {} is missing",
+                    source_root.display()
+                ),
+            ));
+            continue;
+        }
+        let mut source_files = Vec::new();
+        collect_rust_sources(source_root, &mut source_files, &mut violations);
+        source_files.sort();
+        if source_files.is_empty() {
+            violations.push(Violation::new(
+                1,
+                format!(
+                    "configured crate {crate_name} source directory {} has no Rust source files",
+                    source_root.display()
+                ),
+            ));
+            continue;
+        }
+        for source_path in source_files {
+            let bytes = match fs::read(&source_path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    violations.push(Violation::new(
+                        1,
+                        format!(
+                            "{} line 1: cannot read configured source: {error}",
+                            source_path.display()
+                        ),
+                    ));
+                    continue;
+                }
+            };
+            let source = match String::from_utf8(bytes) {
+                Ok(source) => source,
+                Err(error) => {
+                    violations.push(Violation::new(
+                        1,
+                        format!(
+                            "{} line 1: configured source is not valid UTF-8: {error}",
+                            source_path.display()
+                        ),
+                    ));
+                    continue;
+                }
+            };
+            violations.extend(qualify_violations(
+                &source_path,
+                scan_source(&source, &policy.forbidden_tokens),
+            ));
+        }
+    }
+    violations
+}
+
+fn collect_rust_sources(
+    directory: &Path,
+    sources: &mut Vec<PathBuf>,
+    violations: &mut Vec<Violation>,
+) {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            violations.push(Violation::new(
+                1,
+                format!(
+                    "{} line 1: cannot read configured source directory: {error}",
+                    directory.display()
+                ),
+            ));
+            return;
+        }
+    };
+    let mut entries: Vec<_> = entries.collect();
+    entries.sort_by_key(|entry| {
+        entry
+            .as_ref()
+            .map_or_else(|_| PathBuf::new(), std::fs::DirEntry::path)
+    });
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                violations.push(Violation::new(
+                    1,
+                    format!(
+                        "{} line 1: cannot read configured source entry: {error}",
+                        directory.display()
+                    ),
+                ));
+                continue;
+            }
+        };
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                violations.push(Violation::new(
+                    1,
+                    format!(
+                        "{} line 1: cannot inspect configured source: {error}",
+                        path.display()
+                    ),
+                ));
+                continue;
+            }
+        };
+        if file_type.is_symlink() {
+            violations.push(Violation::new(
+                1,
+                format!(
+                    "{} line 1: configured source symlinks are not traversed",
+                    path.display()
+                ),
+            ));
+        } else if file_type.is_dir() {
+            collect_rust_sources(&path, sources, violations);
+        } else if file_type.is_file() && path.extension().and_then(OsStr::to_str) == Some("rs") {
+            sources.push(path);
+        }
+    }
+}
+
+fn lex_rust(source: &str) -> (Vec<u8>, Vec<bool>) {
+    let bytes = source.as_bytes();
+    let mut cleaned = bytes.to_vec();
+    let mut syntax = vec![true; bytes.len()];
+    let mut index = 0;
+    let mut block_depth = 0_u32;
+    while index < bytes.len() {
+        if block_depth > 0 {
+            syntax[index] = false;
+            if bytes.get(index..index + 2) == Some(b"/*") {
+                cleaned[index] = b' ';
+                cleaned[index + 1] = b' ';
+                syntax[index + 1] = false;
+                block_depth += 1;
+                index += 2;
+            } else if bytes.get(index..index + 2) == Some(b"*/") {
+                cleaned[index] = b' ';
+                cleaned[index + 1] = b' ';
+                syntax[index + 1] = false;
+                block_depth -= 1;
+                index += 2;
+            } else {
+                if cleaned[index] != b'\n' {
+                    cleaned[index] = b' ';
+                }
+                index += 1;
+            }
+            continue;
+        }
+        if bytes.get(index..index + 2) == Some(b"//") {
+            while index < bytes.len() && bytes[index] != b'\n' {
+                cleaned[index] = b' ';
+                syntax[index] = false;
+                index += 1;
+            }
+            continue;
+        }
+        if bytes.get(index..index + 2) == Some(b"/*") {
+            cleaned[index] = b' ';
+            cleaned[index + 1] = b' ';
+            syntax[index] = false;
+            syntax[index + 1] = false;
+            block_depth = 1;
+            index += 2;
+            continue;
+        }
+        if let Some(end) = rust_literal_end(bytes, index) {
+            for item in syntax.iter_mut().take(end).skip(index) {
+                *item = false;
+            }
+            index = end;
+            continue;
+        }
+        index += 1;
+    }
+    (cleaned, syntax)
+}
+
+fn rust_literal_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut quote_index = start;
+    if matches!(bytes.get(start), Some(b'b' | b'c')) && bytes.get(start + 1) == Some(&b'"') {
+        quote_index += 1;
+    }
+    if bytes.get(quote_index) == Some(&b'"') {
+        return Some(quoted_literal_end(bytes, quote_index, b'"'));
+    }
+    if bytes.get(quote_index) == Some(&b'\'') {
+        return character_literal_end(bytes, quote_index);
+    }
+    let raw_start = if bytes.get(start) == Some(&b'r') {
+        start
+    } else if matches!(bytes.get(start), Some(b'b' | b'c')) && bytes.get(start + 1) == Some(&b'r') {
+        start + 1
+    } else {
+        return None;
+    };
+    let mut index = raw_start + 1;
+    let mut hashes = 0;
+    while bytes.get(index) == Some(&b'#') {
+        hashes += 1;
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b'"') {
+        return None;
+    }
+    index += 1;
+    while index < bytes.len() {
+        if bytes[index] == b'"'
+            && bytes.get(index + 1..index + 1 + hashes) == Some(&vec![b'#'; hashes])
+        {
+            return Some(index + 1 + hashes);
+        }
+        index += 1;
+    }
+    Some(bytes.len())
+}
+
+fn quoted_literal_end(bytes: &[u8], quote_index: usize, quote: u8) -> usize {
+    let mut index = quote_index + 1;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            index = (index + 2).min(bytes.len());
+        } else if bytes[index] == quote {
+            return index + 1;
+        } else {
+            index += 1;
+        }
+    }
+    bytes.len()
+}
+
+fn character_literal_end(bytes: &[u8], quote_index: usize) -> Option<usize> {
+    let mut index = quote_index + 1;
+    while index < bytes.len() && bytes[index] != b'\n' {
+        if bytes[index] == b'\\' {
+            index = (index + 2).min(bytes.len());
+        } else if bytes[index] == b'\'' {
+            return Some(index + 1);
+        } else {
+            index += 1;
+        }
+    }
+    None
+}
+
+fn mask_cfg_test_items(cleaned: &mut [u8], syntax: &[bool]) {
+    let mut index = 0;
+    while index + 2 < cleaned.len() {
+        if cleaned[index] != b'#' || cleaned[index + 1] != b'[' || !syntax[index] {
+            index += 1;
+            continue;
+        }
+        let Some(attribute_end) = matching_delimiter(cleaned, syntax, index + 1, b'[', b']') else {
+            index += 1;
+            continue;
+        };
+        let canonical: String = cleaned[index + 2..attribute_end]
+            .iter()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .map(|byte| char::from(*byte))
+            .collect();
+        if canonical != "cfg(test)" {
+            index = attribute_end + 1;
+            continue;
+        }
+        let mut item_start = attribute_end + 1;
+        loop {
+            while cleaned.get(item_start).is_some_and(u8::is_ascii_whitespace) {
+                item_start += 1;
+            }
+            if cleaned.get(item_start..item_start + 2) != Some(b"#[") {
+                break;
+            }
+            let Some(next_end) = matching_delimiter(cleaned, syntax, item_start + 1, b'[', b']')
+            else {
+                break;
+            };
+            item_start = next_end + 1;
+        }
+        let mut cursor = item_start;
+        let mut end = cleaned.len();
+        while cursor < cleaned.len() {
+            if syntax[cursor] && cleaned[cursor] == b'{' {
+                end = matching_delimiter(cleaned, syntax, cursor, b'{', b'}')
+                    .map_or(cleaned.len(), |position| position + 1);
+                break;
+            }
+            if syntax[cursor] && cleaned[cursor] == b';' {
+                end = cursor + 1;
+                break;
+            }
+            cursor += 1;
+        }
+        for byte in &mut cleaned[index..end] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+        index = end;
+    }
+}
+
+fn matching_delimiter(
+    bytes: &[u8],
+    syntax: &[bool],
+    start: usize,
+    open: u8,
+    close: u8,
+) -> Option<usize> {
+    let mut depth = 0_u32;
+    for index in start..bytes.len() {
+        if !syntax[index] {
+            continue;
+        }
+        if bytes[index] == open {
+            depth += 1;
+        } else if bytes[index] == close {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
 }
 
 fn read_file(path: &Path) -> Result<String, Vec<Violation>> {
@@ -1571,14 +1975,16 @@ mod tests {
         for (crate_name, policy) in config.crates {
             for token in policy.forbidden_tokens {
                 checked += 1;
-                let source = format!("fn harmless() {{}}\nfn violation() {{ {token}; }}\n");
+                let source = format!(
+                    "// {token} in a line comment\n/* {token} in a block comment */\n#[cfg(test)]\nmod tests {{ fn allowed() {{ {token}; }} }}\nfn violation() {{ {token}; }}\n"
+                );
                 let violations = scan_source(&source, std::slice::from_ref(&token));
                 assert_eq!(
                     violations.len(),
                     1,
                     "crate {crate_name} token {token:?} was not detected: {violations:?}"
                 );
-                assert_eq!(violations[0].line, 2, "crate {crate_name} token {token:?}");
+                assert_eq!(violations[0].line, 5, "crate {crate_name} token {token:?}");
                 assert!(
                     violations[0].message.contains(&token),
                     "crate {crate_name} token {token:?}: {:?}",
@@ -1594,7 +2000,7 @@ mod tests {
 
     #[test]
     fn arch_r0_05_ignores_comments_and_nested_cfg_test_items() {
-        let source = r#"// SystemTime::now in a line comment
+        let source = r"// SystemTime::now in a line comment
 /// SystemTime::now in a doc comment
 //! SystemTime::now in an inner doc comment
 /* SystemTime::now in an outer block
@@ -1611,7 +2017,7 @@ fn test_only_item() { SystemTime::now(); }
 fn production() {
     SystemTime::now();
 }
-"#;
+";
         let violations = scan_source(source, &["SystemTime::now".to_owned()]);
         assert_eq!(violations.len(), 1, "{violations:?}");
         assert_eq!(violations[0].line, 16);

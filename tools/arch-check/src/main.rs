@@ -25,13 +25,24 @@ fn main() {
 }
 
 fn run_fixture_mode(arguments: &[std::ffi::OsString]) -> Result<(), Vec<arch_check::Violation>> {
-    if arguments.len() != 4 || arguments[0] != "--metadata-fixture" || arguments[2] != "--config" {
+    if arguments.len() != 4 || arguments[2] != "--config" {
         return Err(vec![arch_check::Violation {
             line: 1,
-            message: "usage: arch-check [--metadata-fixture PATH --config PATH]".to_owned(),
+            message: "usage: arch-check [--metadata-fixture PATH | --source-fixture-root PATH] --config PATH"
+                .to_owned(),
         }]);
     }
-    arch_check::check_fixture_files(Path::new(&arguments[1]), Path::new(&arguments[3]))
+    if arguments[0] == "--metadata-fixture" {
+        arch_check::check_fixture_files(Path::new(&arguments[1]), Path::new(&arguments[3]))
+    } else if arguments[0] == "--source-fixture-root" {
+        arch_check::check_source_fixture_files(Path::new(&arguments[1]), Path::new(&arguments[3]))
+    } else {
+        Err(vec![arch_check::Violation {
+            line: 1,
+            message: "usage: arch-check [--metadata-fixture PATH | --source-fixture-root PATH] --config PATH"
+                .to_owned(),
+        }])
+    }
 }
 
 fn locate_workspace_root() -> Result<PathBuf, String> {

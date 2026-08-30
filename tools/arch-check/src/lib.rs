@@ -40,6 +40,38 @@ pub fn scan_canaries(_source: &str) -> Vec<Violation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output};
+
+    fn fixture_path(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/r0_04")
+            .join(name)
+    }
+
+    fn run_arch_fixture(metadata: &str, config: &Path) -> Output {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = manifest_dir
+            .parent()
+            .and_then(Path::parent)
+            .expect("arch-check must live at tools/arch-check");
+        Command::new(env!("CARGO"))
+            .args([
+                "run",
+                "--quiet",
+                "--locked",
+                "-p",
+                "arch-check",
+                "--",
+                "--metadata-fixture",
+            ])
+            .arg(fixture_path(metadata))
+            .arg("--config")
+            .arg(config)
+            .current_dir(workspace_root)
+            .output()
+            .expect("fixture invocation must start")
+    }
 
     #[test]
     fn arch_exact_pin_rejects_floating_requirement() {
@@ -52,6 +84,56 @@ mod tests {
     fn arch_exact_pin_accepts_pinned_and_workspace_requirements() {
         let source = "[dependencies]\nbytes = \"=1.9.0\"\nrelay-core = { workspace = true }\n";
         assert!(check_exact_requirements(source).is_empty());
+    }
+
+    #[test]
+    fn arch_dependency_graph_accepts_allowlisted_fixture() {
+        let output = run_arch_fixture("metadata-allowed.json", &fixture_path("arch-valid.toml"));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("architecture checks passed"),
+            "fixture mode did not run the dependency check"
+        );
+    }
+
+    #[test]
+    fn arch_dependency_graph_rejects_forbidden_dependency() {
+        let output = run_arch_fixture("metadata-forbidden.json", &fixture_path("arch-valid.toml"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "forbidden graph was accepted");
+        assert!(stderr.contains("relay-core"), "{stderr}");
+        assert!(stderr.contains("rand"), "{stderr}");
+    }
+
+    #[test]
+    fn arch_config_rejects_malformed_policy() {
+        let output = run_arch_fixture("metadata-allowed.json", &fixture_path("arch-malformed.toml"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "malformed arch.toml was accepted");
+        assert!(stderr.contains("arch-malformed.toml"), "{stderr}");
+        assert!(stderr.contains("line"), "{stderr}");
+    }
+
+    #[test]
+    fn arch_config_rejects_empty_crate_list() {
+        let output = run_arch_fixture("metadata-allowed.json", &fixture_path("arch-empty.toml"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "empty crate policy was accepted");
+        assert!(stderr.contains("no crate policies"), "{stderr}");
+    }
+
+    #[test]
+    fn arch_config_rejects_unreadable_input() {
+        let unreadable = fixture_path("unreadable-directory");
+        let output = run_arch_fixture("metadata-allowed.json", &unreadable);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "unreadable config input was skipped");
+        assert!(stderr.contains("unreadable-directory"), "{stderr}");
+        assert!(stderr.contains("cannot read"), "{stderr}");
     }
 
     #[test]

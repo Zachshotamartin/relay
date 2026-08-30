@@ -1,0 +1,1 @@
+# A policy file with no crate entries must fail closed.

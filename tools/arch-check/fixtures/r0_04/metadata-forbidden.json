@@ -1,0 +1,16 @@
+{
+  "packages": [
+    {
+      "name": "relay-core",
+      "id": "path+file:///fixture/relay-core#0.1.0",
+      "manifest_path": "/fixture/relay-core/Cargo.toml",
+      "dependencies": [
+        { "name": "im", "rename": null, "kind": null },
+        { "name": "rand", "rename": null, "kind": null }
+      ]
+    }
+  ],
+  "workspace_members": [
+    "path+file:///fixture/relay-core#0.1.0"
+  ]
+}

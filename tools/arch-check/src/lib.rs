@@ -907,6 +907,11 @@ pub fn validate_source_layout(manifest: &str) -> Vec<Violation> {
     violations
 }
 
+#[must_use]
+pub fn validate_package_source_layout(_manifest_path: &Path) -> Vec<Violation> {
+    Vec::new()
+}
+
 fn cargo_table_header(line: &str) -> Option<String> {
     if let Some(inner) = line
         .strip_prefix("[[")
@@ -4328,6 +4333,55 @@ pub fn production() {
     }
 
     #[test]
+    fn arch_r0_05_rejects_grouped_std_aliases() {
+        let grouped_alias = concat!(
+            "use {std as platform};\n",
+            "use platform::time::SystemTime as Clock;\n",
+            "fn production() { let _ = Clock::now(); }\n",
+        );
+        let alias_violations = scan_source(grouped_alias, &["std::time".to_owned()]);
+        assert_eq!(alias_violations.len(), 1, "{alias_violations:?}");
+        assert_eq!(alias_violations[0].line, 1);
+    }
+
+    #[test]
+    fn arch_r0_05_normalizes_raw_identifiers() {
+        let raw_path = "fn production() { let _ = std::r#time::SystemTime::now(); }\n";
+        let raw_violations = scan_source(raw_path, &["std::time".to_owned()]);
+        assert_eq!(raw_violations.len(), 1, "{raw_violations:?}");
+
+        let raw_attribute = "#[r#path = \"../outside.rs\"]\nmod hidden;\n";
+        let attribute_violations = scan_source(raw_attribute, &["std::time".to_owned()]);
+        assert_eq!(attribute_violations.len(), 1, "{attribute_violations:?}");
+        assert!(attribute_violations[0].message.contains("#[path]"));
+    }
+
+    #[test]
+    fn arch_r0_05_cfg_test_tokens_inside_macros_do_not_mask_production() {
+        let source = concat!(
+            "macro_rules! generate {\n",
+            "    (#[cfg(test)]) => {\n",
+            "        fn production() { let _ = std::time::SystemTime::now(); }\n",
+            "    };\n",
+            "}\n",
+            "generate!(#[cfg(test)]);\n",
+        );
+        let violations = scan_source(source, &["std::time".to_owned()]);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].line, 3);
+    }
+
+    #[test]
+    fn arch_r0_05_cfg_attr_path_indirection_fails_closed() {
+        let source =
+            "#[cfg_attr(not(test), path = \"../outside.rs\")]\nmod hidden;\nfn harmless() {}\n";
+        let violations = scan_source(source, &["std::time".to_owned()]);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].line, 1);
+        assert!(violations[0].message.contains("path"));
+    }
+
+    #[test]
     fn arch_r0_05_scans_included_rust_sources_without_rs_extension() {
         let temp_root =
             std::env::temp_dir().join(format!("relay-arch-r0-05-include-{}", std::process::id()));
@@ -4355,6 +4409,40 @@ pub fn production() {
     }
 
     #[test]
+    fn arch_r0_05_macro_indirected_include_fails_closed() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "relay-arch-r0-05-macro-include-{}",
+            std::process::id()
+        ));
+        let source_dir = temp_root.join("crates/relay-core/src");
+        fs::create_dir_all(&source_dir).expect("temporary source tree must be created");
+        fs::write(
+            source_dir.join("lib.rs"),
+            concat!(
+                "macro_rules! call { ($macro:ident, $path:literal) => { $macro!($path); } }\n",
+                "call!(include, \"hidden.inc\");\n",
+            ),
+        )
+        .expect("crate root must be written");
+        fs::write(
+            source_dir.join("hidden.inc"),
+            "fn production() { let _ = SystemTime::now(); }\n",
+        )
+        .expect("macro-included Rust source must be written");
+
+        let result =
+            check_source_fixture_files(&temp_root, &fixture_path("../r0_05/arch-source.toml"));
+        fs::remove_dir_all(&temp_root).expect("temporary fixture must be removed");
+        let violations = result.expect_err("macro-indirected include must fail closed");
+        assert!(
+            violations
+                .iter()
+                .any(|item| item.message.contains("include")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn arch_r0_05_rejects_unscanned_custom_target_paths() {
         let manifest = "[lib]\npath = \"outside/lib.rs\"\n";
         let violations = validate_source_layout(manifest);
@@ -4377,9 +4465,46 @@ pub fn production() {
     }
 
     #[test]
+    fn arch_r0_05_rejects_quoted_target_tables() {
+        let quoted_target = "[[\"bin\"]]\nname = \"hidden\"\npath = \"outside/main.rs\"\n";
+        let target_violations = validate_source_layout(quoted_target);
+        assert_eq!(target_violations.len(), 1, "{target_violations:?}");
+        assert!(target_violations[0].message.contains("custom target path"));
+    }
+
+    #[test]
+    fn arch_r0_05_rejects_implicit_build_scripts() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "relay-arch-r0-05-build-script-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temp_root).expect("temporary package must be created");
+        let manifest_path = temp_root.join("Cargo.toml");
+        fs::write(&manifest_path, "[package]\nname = \"fixture\"\n")
+            .expect("fixture manifest must be written");
+        fs::write(temp_root.join("build.rs"), "fn main() {}\n")
+            .expect("implicit build script must be written");
+        let build_violations = validate_package_source_layout(&manifest_path);
+        fs::remove_dir_all(&temp_root).expect("temporary fixture must be removed");
+        assert_eq!(build_violations.len(), 1, "{build_violations:?}");
+        assert!(build_violations[0].message.contains("build.rs"));
+    }
+
+    #[test]
     fn arch_r0_05_real_policy_covers_every_normative_raft_api() {
         let config = parse_arch_config(include_str!("../arch.toml"))
             .expect("real architecture policy must parse");
+        let wal = config
+            .crates
+            .get("relay-wal")
+            .expect("relay-wal policy must exist");
+        assert!(
+            wal.forbidden_tokens
+                .iter()
+                .any(|token| token == "std::time"),
+            "relay-wal policy must reject aliased wall-clock imports: {:?}",
+            wal.forbidden_tokens
+        );
         let raft = config
             .crates
             .get("relay-raft")
@@ -4457,6 +4582,40 @@ pub fn production() {
         assert!(violations[0].message.contains("line 3"), "{violations:?}");
         assert!(
             !violations[0].message.contains("tests.rs"),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn arch_r0_05_unreachable_module_cannot_poison_test_exclusions() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "relay-arch-r0-05-exclusion-poison-{}",
+            std::process::id()
+        ));
+        let source_dir = temp_root.join("crates/relay-core/src");
+        fs::create_dir_all(source_dir.join("foo")).expect("temporary source tree must be created");
+        fs::write(
+            source_dir.join("lib.rs"),
+            "mod foo { mod bar; pub fn call() { bar::production(); } }\n",
+        )
+        .expect("crate root must be written");
+        fs::write(source_dir.join("foo.rs"), "#[cfg(test)]\nmod bar;\n")
+            .expect("unreachable poison source must be written");
+        fs::write(
+            source_dir.join("foo/bar.rs"),
+            "pub fn production() { let _ = SystemTime::now(); }\n",
+        )
+        .expect("production nested module must be written");
+
+        let result =
+            check_source_fixture_files(&temp_root, &fixture_path("../r0_05/arch-source.toml"));
+        fs::remove_dir_all(&temp_root).expect("temporary fixture must be removed");
+        let violations = result.expect_err("unreachable source must not hide production");
+        assert!(
+            violations
+                .iter()
+                .any(|item| item.message.contains("foo/bar.rs")
+                    && item.message.contains("SystemTime::now")),
             "{violations:?}"
         );
     }

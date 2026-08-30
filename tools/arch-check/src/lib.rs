@@ -1321,13 +1321,107 @@ pub fn check_r0_06_fixture_files(
 }
 
 #[must_use]
-pub fn validate_test_names(_source: &str) -> Vec<Violation> {
-    Vec::new()
+pub fn validate_test_names(source: &str) -> Vec<Violation> {
+    const FAMILY_PREFIXES: [&str; 17] = [
+        "core_", "stor_", "crsh_", "sim_", "modl_", "fifo_", "topc_", "wire_", "fuzz_", "raft_",
+        "admn_", "opsx_", "migr_", "soak_", "bench_", "mut_", "mkt_",
+    ];
+
+    let (cleaned, syntax) = lex_rust(source);
+    let tokens = rust_tokens(&cleaned, &syntax);
+    let mut tested_functions = BTreeSet::new();
+    let mut violations = Vec::new();
+    let mut index = 0;
+    while index + 2 < tokens.len() {
+        if tokens[index].text != "#" || tokens[index + 1].text != "[" {
+            index += 1;
+            continue;
+        }
+        let Some(attribute_end) = token_delimiter_end(&tokens, index + 1, "[", "]") else {
+            index += 1;
+            continue;
+        };
+        if !is_test_attribute(&tokens[index + 2..attribute_end]) {
+            index = attribute_end + 1;
+            continue;
+        }
+
+        let mut cursor = attribute_end + 1;
+        while tokens.get(cursor).is_some_and(|token| token.text == "#")
+            && tokens
+                .get(cursor + 1)
+                .is_some_and(|token| token.text == "[")
+        {
+            let Some(end) = token_delimiter_end(&tokens, cursor + 1, "[", "]") else {
+                break;
+            };
+            cursor = end + 1;
+        }
+        while let Some(token) = tokens.get(cursor) {
+            if token.text == "fn" {
+                break;
+            }
+            if matches!(token.text.as_str(), ";" | "{" | "}") {
+                cursor = tokens.len();
+                break;
+            }
+            cursor += 1;
+        }
+        let Some(name) = tokens
+            .get(cursor + 1)
+            .filter(|_| tokens.get(cursor).is_some_and(|token| token.text == "fn"))
+        else {
+            index = attribute_end + 1;
+            continue;
+        };
+        if tested_functions.insert(name.offset)
+            && !FAMILY_PREFIXES
+                .iter()
+                .any(|prefix| name.text.starts_with(prefix))
+        {
+            violations.push(Violation::new(
+                name.line,
+                format!(
+                    "test function {:?} must begin with a lowercase evidence-family prefix",
+                    name.text
+                ),
+            ));
+        }
+        index = attribute_end + 1;
+    }
+    violations
 }
 
 #[must_use]
-pub fn scan_canaries(_source: &str) -> Vec<Violation> {
-    Vec::new()
+pub fn scan_canaries(source: &str) -> Vec<Violation> {
+    source
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains("RELAY_CANARY_"))
+        .map(|(index, _)| {
+            Violation::new(
+                index + 1,
+                "captured output contains a redaction canary; value withheld",
+            )
+        })
+        .collect()
+}
+
+fn is_test_attribute(tokens: &[RustToken]) -> bool {
+    if tokens.len() == 1 {
+        return matches!(
+            tokens[0].text.as_str(),
+            "test" | "rstest" | "proptest" | "test_case"
+        );
+    }
+    tokens.last().is_some_and(|token| token.text == "test")
+        && tokens.iter().enumerate().all(|(index, token)| {
+            if index % 2 == 0 {
+                is_rust_identifier(&token.text)
+            } else {
+                token.text == "::"
+            }
+        })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

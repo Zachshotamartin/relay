@@ -264,6 +264,24 @@ fn helper_is_not_a_test() {}
 
             self.assertEqual([], check_test_names.find_violations(Path(directory)))
 
+    def test_r0_name_16_rejects_qualified_alias_with_builtin_tail(self) -> None:
+        source = """mod attrs {
+    pub use tokio::test as inline;
+}
+
+#[attrs::inline]
+async fn bad_name() {}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tests" / "qualified_alias.rs"
+            path.parent.mkdir()
+            path.write_text(source, encoding="utf-8")
+
+            violations = check_test_names.find_violations(Path(directory))
+
+        self.assertEqual(["bad_name"], [item.name for item in violations])
+        self.assertEqual([6], [item.line for item in violations])
+
 
 if __name__ == "__main__":
     unittest.main()

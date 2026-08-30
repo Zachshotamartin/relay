@@ -29,6 +29,7 @@ jobs:
       - uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
         with:
           just-version: 1.36.0
+          github-token: ""
       - run: just fmt
 
   lint:
@@ -47,6 +48,7 @@ jobs:
       - uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
         with:
           just-version: 1.36.0
+          github-token: ""
       - run: just lint
 
   msrv:
@@ -64,6 +66,7 @@ jobs:
       - uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
         with:
           just-version: 1.36.0
+          github-token: ""
       - run: just msrv
 
   deny:
@@ -81,6 +84,7 @@ jobs:
       - uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
         with:
           just-version: 1.36.0
+          github-token: ""
       - name: Install cargo-deny 0.20.2
         shell: bash
         env:
@@ -113,6 +117,7 @@ jobs:
       - uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
         with:
           just-version: 1.36.0
+          github-token: ""
       - run: just arch
       - run: just pr-policy
         if: github.event_name == 'pull_request'
@@ -159,6 +164,7 @@ jobs:
         if: github.event_name != 'pull_request' || matrix.on_pull_request
         with:
           just-version: 1.36.0
+          github-token: ""
       - run: just test
         if: github.event_name != 'pull_request' || matrix.on_pull_request
 
@@ -178,6 +184,7 @@ jobs:
       - uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
         with:
           just-version: 1.36.0
+          github-token: ""
       - name: Install cargo-deny 0.20.2 for cold gate replay
         shell: bash
         env:

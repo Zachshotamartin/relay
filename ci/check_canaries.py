@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,7 +21,7 @@ CANARY_PREFIX = b"RELAY_CANARY_"
 _CANARY_TEXT = CANARY_PREFIX.decode("ascii")
 _BASE64_TOKEN = re.compile(rb"[A-Za-z0-9+/_-]{8,}={0,2}")
 _HEX_PREFIX = CANARY_PREFIX.hex().encode("ascii")
-_ENCODING_ORDER = {"raw": 0, "base64": 1, "hex": 2}
+_ENCODING_ORDER = {"raw": 0, "base64": 1, "hex": 2, "url": 3}
 
 
 class ScanError(RuntimeError):
@@ -32,6 +33,12 @@ def _safe_text(value: object) -> str:
     marker = text.find(_CANARY_TEXT)
     if marker >= 0:
         return f"{text[:marker]}<redacted-canary>"
+    components = re.split(r"[/\\]", text)
+    if any(
+        _encodings(component.encode("utf-8", errors="surrogateescape"))
+        for component in components
+    ):
+        return "<redacted-canary-path>"
     return text
 
 
@@ -117,10 +124,15 @@ def _encodings(data: bytes) -> list[str]:
     encodings: list[str] = []
     if CANARY_PREFIX in data:
         encodings.append("raw")
-    if _contains_base64_canary(data):
+    compact_base64 = re.sub(rb"[\t\n\r ]+", b"", data)
+    if _contains_base64_canary(data) or _contains_base64_canary(compact_base64):
         encodings.append("base64")
-    if re.search(re.escape(_HEX_PREFIX), data, flags=re.IGNORECASE) is not None:
+    compact_hex = re.sub(rb"[\t\n\r :,_-]+", b"", data)
+    if re.search(re.escape(_HEX_PREFIX), compact_hex, flags=re.IGNORECASE) is not None:
         encodings.append("hex")
+    decoded_url = urllib.parse.unquote_to_bytes(data)
+    if decoded_url != data and CANARY_PREFIX in decoded_url:
+        encodings.append("url")
     return encodings
 
 

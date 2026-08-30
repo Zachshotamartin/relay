@@ -1210,6 +1210,7 @@ pub fn validate_status_discipline(source: &str) -> Vec<Violation> {
         .lines()
         .take(5)
         .any(|line| line.trim() == "# ADR-NNNN: Title");
+    let is_adr_document = source.lines().take(5).any(is_numbered_adr_heading);
     let mut violations = Vec::new();
     let mut status = None;
     let mut current_heading_level = None;
@@ -1224,7 +1225,11 @@ pub fn validate_status_discipline(source: &str) -> Vec<Violation> {
         if !is_adr_template && !line.trim().is_empty() {
             if let Some(value) = explicit_status_value(raw_line) {
                 paragraph.flush(status, &mut violations);
-                match parse_status_word(&value) {
+                match parse_status_word(&value).or_else(|| {
+                    is_adr_document
+                        .then(|| parse_adr_status_word(&value))
+                        .flatten()
+                }) {
                     Some(parsed) => {
                         status = Some(parsed);
                         status_scope_level = current_heading_level;
@@ -1440,6 +1445,28 @@ fn parse_status_word(value: &str) -> Option<DeliveryStatus> {
         "deferred" => Some(DeliveryStatus::Deferred),
         _ => None,
     }
+}
+
+fn parse_adr_status_word(value: &str) -> Option<DeliveryStatus> {
+    if value == "proposed" {
+        return Some(DeliveryStatus::Planned);
+    }
+    let identifier = value.strip_prefix("superseded by ADR-")?;
+    (identifier.len() == 4 && identifier.bytes().all(|byte| byte.is_ascii_digit()))
+        .then_some(DeliveryStatus::Deferred)
+}
+
+fn is_numbered_adr_heading(line: &str) -> bool {
+    let Some((identifier, title)) = line
+        .trim()
+        .strip_prefix("# ADR-")
+        .and_then(|rest| rest.split_once(':'))
+    else {
+        return false;
+    };
+    identifier.len() == 4
+        && identifier.bytes().all(|byte| byte.is_ascii_digit())
+        && !title.trim().is_empty()
 }
 
 #[derive(Clone, Debug)]

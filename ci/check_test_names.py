@@ -41,6 +41,12 @@ _FUNCTION = re.compile(
     rf"(?:(?:const|async|unsafe|extern)\s+)*"
     rf"fn\s+(?P<name>{_IDENTIFIER})"
 )
+_DYNAMIC_FUNCTION = re.compile(
+    r"(?:pub\s*(?:\([^)]*\))?\s+)?"
+    r"(?:(?:const|async|unsafe|extern)\s+)*"
+    r"fn\s+\$\s*(?:r#)?[A-Za-z_][A-Za-z0-9_]*"
+)
+_TEST_ATTRIBUTE_NAMES = {"test", "rstest", "proptest", "test_case"}
 
 
 class ScanError(RuntimeError):
@@ -174,15 +180,48 @@ def _matching_bracket(source: str, opening: int) -> int | None:
     return None
 
 
+def _top_level_arguments(contents: str) -> list[str] | None:
+    contents = contents.strip()
+    if not contents.startswith("("):
+        return None
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    stack: list[str] = []
+    arguments: list[str] = []
+    start = 1
+    for index, character in enumerate(contents):
+        if character in pairs:
+            stack.append(pairs[character])
+        elif character in pairs.values():
+            if not stack or stack.pop() != character:
+                return None
+            if not stack:
+                if contents[index + 1 :].strip():
+                    return None
+                arguments.append(contents[start:index].strip())
+                return arguments
+        elif character == "," and len(stack) == 1:
+            arguments.append(contents[start:index].strip())
+            start = index + 1
+    return None
+
+
 def _is_test_attribute(contents: str) -> bool:
     match = _ATTRIBUTE_PATH.match(contents)
     if match is None:
         return False
     segments = re.findall(_IDENTIFIER, match.group("path"))
-    if not segments or segments[-1].removeprefix("r#") != "test":
+    if not segments:
         return False
+    attribute_name = segments[-1].removeprefix("r#")
     remainder = contents[match.end() :].lstrip()
-    return not remainder or remainder.startswith("(")
+    if attribute_name in _TEST_ATTRIBUTE_NAMES:
+        return not remainder or _top_level_arguments(remainder) is not None
+    if attribute_name != "cfg_attr":
+        return False
+    arguments = _top_level_arguments(remainder)
+    if arguments is None or len(arguments) < 2:
+        return False
+    return any(_is_test_attribute(argument) for argument in arguments[1:])
 
 
 def _skip_attributes(source: str, cursor: int) -> int:
@@ -209,6 +248,12 @@ def _test_functions(source: str) -> Iterator[tuple[str, int]]:
         function_start = _skip_attributes(masked, closing + 1)
         function = _FUNCTION.match(masked, function_start)
         if function is None:
+            if _DYNAMIC_FUNCTION.match(masked, function_start) is not None:
+                line = source.count("\n", 0, attribute.start()) + 1
+                key = ("<dynamic-test-name>", line)
+                if key not in seen:
+                    seen.add(key)
+                    yield key
             continue
         name = function.group("name").removeprefix("r#")
         line = source.count("\n", 0, function.start("name")) + 1

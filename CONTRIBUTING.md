@@ -23,6 +23,16 @@ Tests named in the specification are never deleted, ignored, or weakened to
 make a change pass. Domain-state transitions remain immutable, errors remain
 explicit, and every boundary validates its input.
 
+## Test names and evidence families
+
+Rust test functions in any `tests/` tree use the lowercase evidence-family prefix
+defined by the verification matrices in
+[OPERATIONS_TEST_PLAN.md Section 10](docs/OPERATIONS_TEST_PLAN.md#10-detailed-verification-matrices):
+`core_`, `stor_`, `crsh_`, `sim_`, `modl_`, `fifo_`, `topc_`, `wire_`,
+`fuzz_`, `raft_`, `admn_`, `opsx_`, `migr_`, `soak_`, `bench_`, `mut_`, or
+`mkt_`. The prefix is part of the function name so CI can count evidence by
+family; generated tests whose function name cannot be inspected fail closed.
+
 ## Zero-flake policy
 
 Deterministic suites are zero-flake: a flake is a bug. Record the failing seed,

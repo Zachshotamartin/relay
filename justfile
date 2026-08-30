@@ -18,6 +18,7 @@ arch:
     python3 ci/check_pr_policy.py
 
 test:
+    cargo build --workspace --locked
     python3 ci/check_test_names.py .
     python3 ci/check_canaries.py --capture -- cargo test --workspace --locked
     python3 ci/check_canaries.py --capture -- python3 -m unittest discover -s ci/tests -p 'test_*.py'

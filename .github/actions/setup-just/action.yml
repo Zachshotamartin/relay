@@ -1,0 +1,12 @@
+name: Setup pinned just
+description: Install Relay's exact just version from the published locked source graph
+
+runs:
+  using: composite
+  steps:
+    - name: Install just 1.36.0
+      shell: bash
+      run: |
+        set -euo pipefail
+        cargo install just --version 1.36.0 --locked
+        test "$(just --version)" = "just 1.36.0"

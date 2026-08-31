@@ -1,0 +1,12 @@
+[package]
+name = "relay-r0-deny-license"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+publish = false
+
+[dependencies]
+relay-r0-gpl-probe = { version = "=0.0.0", path = "gpl-probe" }
+
+[workspace]

@@ -1,0 +1,11 @@
+[package]
+name = "ulid"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+publish = false
+
+[lib]
+path = "lib.rs"
+

@@ -1,0 +1,12 @@
+[package]
+name = "relay-r0-clippy-violation"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[workspace]
+
+[lints.clippy]
+pedantic = "deny"
+

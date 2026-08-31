@@ -1,0 +1,184 @@
+name: R0 CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: r0-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.85.0
+          components: rustfmt
+      - uses: ./.github/actions/setup-just
+      - run: just fmt
+
+  lint:
+    name: lint
+    needs: fmt
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.85.0
+          components: clippy
+      - uses: ./.github/actions/setup-just
+      - run: just lint
+
+  msrv:
+    name: msrv
+    needs: lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.85.0
+      - uses: ./.github/actions/setup-just
+      - run: just msrv
+
+  deny:
+    name: deny
+    needs: msrv
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.85.0
+      - uses: ./.github/actions/setup-just
+      - name: Install cargo-deny 0.20.2
+        shell: bash
+        env:
+          CARGO_DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz"
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+            'https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz' \
+            --output "${archive}"
+          printf '%s  %s\n' "${CARGO_DENY_SHA256}" "${archive}" | sha256sum --check --status
+          tar --extract --gzip --file "${archive}" --directory "${RUNNER_TEMP}"
+          install -m 0755 \
+            "${RUNNER_TEMP}/cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny" \
+            "${HOME}/.cargo/bin/cargo-deny"
+          test "$(cargo deny --version)" = "cargo-deny 0.20.2"
+      - run: just deny
+
+  arch:
+    name: arch
+    needs: deny
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.85.0
+      - uses: ./.github/actions/setup-just
+      - run: just arch
+      - run: just pr-policy
+        if: github.event_name == 'pull_request'
+        env:
+          RELAY_PR_TITLE: ${{ github.event.pull_request.title }}
+          RELAY_PR_BODY: ${{ github.event.pull_request.body }}
+
+  test:
+    name: test (${{ matrix.platform }})
+    needs: arch
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            architecture: x86_64
+            advisory: false
+            on_pull_request: true
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+            architecture: aarch64
+            advisory: false
+            on_pull_request: true
+          - platform: macos-aarch64
+            runner: macos-15
+            architecture: aarch64
+            tier: advisory
+            advisory: true
+            on_pull_request: false
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.advisory }}
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name != 'pull_request' || matrix.on_pull_request
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        if: github.event_name != 'pull_request' || matrix.on_pull_request
+        with:
+          toolchain: 1.85.0
+      - uses: ./.github/actions/setup-just
+        if: github.event_name != 'pull_request' || matrix.on_pull_request
+      - run: just test
+        if: github.event_name != 'pull_request' || matrix.on_pull_request
+
+  gates:
+    name: gates
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.85.0
+          components: rustfmt, clippy
+      - uses: ./.github/actions/setup-just
+      - name: Install cargo-deny 0.20.2 for cold gate replay
+        shell: bash
+        env:
+          CARGO_DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz"
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+            'https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz' \
+            --output "${archive}"
+          printf '%s  %s\n' "${CARGO_DENY_SHA256}" "${archive}" | sha256sum --check --status
+          tar --extract --gzip --file "${archive}" --directory "${RUNNER_TEMP}"
+          install -m 0755 \
+            "${RUNNER_TEMP}/cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny" \
+            "${HOME}/.cargo/bin/cargo-deny"
+          test "$(cargo deny --version)" = "cargo-deny 0.20.2"
+      - run: just gates
